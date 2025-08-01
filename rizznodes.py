@@ -10,18 +10,14 @@ import gc
 import comfy.model_management as mm
 import folder_paths
 
-# Set up logging for trimesh to suppress verbose output if desired
 logging.getLogger('trimesh').setLevel(logging.ERROR)
 
-# This is the special class that bypasses type checking
 class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
 
-# We create an instance of it for use in our nodes
 any = AnyType("*")
 
-# A dictionary to store the state for each instance of the nodes.
 _NODE_STATE = {}
 
 
@@ -454,7 +450,6 @@ class RizzAnything:
     def IS_CHANGED(s, anything):
         return float("NaN")
 
-# A dictionary to map node class names to their respective classes
 NODE_CLASS_MAPPINGS = {
     "RizzLoadLatestImage": RizzLoadLatestImage,
     "RizzLoadLatestMesh": RizzLoadLatestMesh,
@@ -466,7 +461,6 @@ NODE_CLASS_MAPPINGS = {
     "RizzAnything": RizzAnything,
 }
 
-# A dictionary to map node class names to their display names
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzLoadLatestImage": "Load Latest Image (Rizz)",
     "RizzLoadLatestMesh": "Load Latest Mesh (Rizz)",
