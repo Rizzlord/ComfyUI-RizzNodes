@@ -147,8 +147,8 @@ class RizzBatchImageLoader:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "INT", "INT",)
-    RETURN_NAMES = ("IMAGE", "CURRENT_FILENAME", "CURRENT_INDEX", "TOTAL_IMAGES",)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "INT", "INT",)
+    RETURN_NAMES = ("CURRENT_IMAGE", "IMAGE_BATCH", "CURRENT_FILENAME", "CURRENT_INDEX", "TOTAL_IMAGES",)
     FUNCTION = "load_next_image"
     CATEGORY = "RizzNodes/Image"
 
@@ -162,48 +162,75 @@ class RizzBatchImageLoader:
                 "current_image_data": None
             }
         state = _NODE_STATE[instance_id]
+
         if reset_index or directory != state["last_directory"]:
             state["current_index"] = -1
             state["last_directory"] = directory
             state["image_files"] = []
             print(f"RizzBatchImageLoader: Resetting index for instance {instance_id}")
-        if not state["image_files"] or directory != state["last_directory"]:
-            input_dir = folder_paths.get_input_directory() if not os.path.isabs(directory) else directory
-            if not os.path.isdir(input_dir):
-                print(f"RizzBatchImageLoader Error: Directory not found - {input_dir}")
-                return (torch.zeros(64, 64, 3), "Directory Not Found", 0, 0)
+
+        base_dir = folder_paths.get_input_directory() if not os.path.isabs(directory) else directory
+        
+        if not state["image_files"]:
+            if not os.path.isdir(base_dir):
+                print(f"RizzBatchImageLoader Error: Directory not found - {base_dir}")
+                empty_tensor = torch.zeros((1, 64, 64, 3))
+                return (empty_tensor, empty_tensor, "Directory Not Found", 0, 0)
+
             valid_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
             try:
                 state["image_files"] = sorted([
-                    f for f in os.listdir(input_dir)
-                    if f.lower().endswith(valid_extensions) and os.path.isfile(os.path.join(input_dir, f))
+                    f for f in os.listdir(base_dir)
+                    if f.lower().endswith(valid_extensions) and os.path.isfile(os.path.join(base_dir, f))
                 ])
                 if not state["image_files"]:
-                    print(f"RizzBatchImageLoader Warning: No valid image files found in {input_dir}")
-                    return (torch.zeros(64, 64, 3), "No Images Found", 0, 0)
+                    print(f"RizzBatchImageLoader Warning: No valid image files found in {base_dir}")
+                    empty_tensor = torch.zeros((1, 64, 64, 3))
+                    return (empty_tensor, empty_tensor, "No Images Found", 0, 0)
             except Exception as e:
-                print(f"RizzBatchImageLoader Error listing directory {input_dir}: {e}")
-                return (torch.zeros(64, 64, 3), f"Error listing directory: {e}", 0, 0)
+                print(f"RizzBatchImageLoader Error listing directory {base_dir}: {e}")
+                empty_tensor = torch.zeros((1, 64, 64, 3))
+                return (empty_tensor, empty_tensor, f"Error listing directory: {e}", 0, 0)
+
         total_images = len(state["image_files"])
         state["current_index"] += 1
         if state["current_index"] >= total_images:
             state["current_index"] = 0
             print(f"RizzBatchImageLoader: Looping back to the first image for instance {instance_id}")
+
         if total_images == 0:
-            print(f"RizzBatchImageLoader Warning: No images to load after index update for instance {instance_id}")
-            return (torch.zeros(64, 64, 3), "No Images Available", 0, 0)
+            empty_tensor = torch.zeros((1, 64, 64, 3))
+            return (empty_tensor, empty_tensor, "No Images Available", 0, 0)
+
+        # Load all images for the batch output
+        batch_images_list = []
+        for filename in state["image_files"]:
+            image_path = os.path.join(base_dir, filename)
+            try:
+                img = Image.open(image_path).convert("RGB")
+                img_np = np.array(img).astype(np.float32) / 255.0
+                image_tensor = torch.from_numpy(img_np)[None,]
+                batch_images_list.append(image_tensor)
+            except Exception as e:
+                print(f"RizzBatchImageLoader Error loading image {image_path} for batch: {e}")
+        
+        image_batch_tensor = torch.cat(batch_images_list, dim=0) if batch_images_list else torch.zeros((1, 64, 64, 3))
+
+        # Load the single current image for the iterative output
         current_filename = state["image_files"][state["current_index"]]
-        image_path = os.path.join(folder_paths.get_input_directory() if not os.path.isabs(directory) else directory, current_filename)
+        current_image_path = os.path.join(base_dir, current_filename)
         try:
-            img = Image.open(image_path).convert("RGB")
-            img = np.array(img).astype(np.float32) / 255.0
-            image_tensor = torch.from_numpy(img)[None,]
-            state["current_image_data"] = image_tensor
+            current_img_pil = Image.open(current_image_path).convert("RGB")
+            current_img_np = np.array(current_img_pil).astype(np.float32) / 255.0
+            current_image_tensor = torch.from_numpy(current_img_np)[None,]
+            
             print(f"RizzBatchImageLoader: Loaded image {current_filename} (Index: {state['current_index']}/{total_images-1}) for instance {instance_id}")
-            return (image_tensor, current_filename, state["current_index"], total_images)
+            return (current_image_tensor, image_batch_tensor, current_filename, state["current_index"], total_images)
         except Exception as e:
-            print(f"RizzBatchImageLoader Error loading image {image_path}: {e}")
-            return (torch.zeros(64, 64, 3), f"Error loading: {current_filename}", state["current_index"], total_images)
+            print(f"RizzBatchImageLoader Error loading current image {current_image_path}: {e}")
+            empty_tensor = torch.zeros((1, 64, 64, 3))
+            return (empty_tensor, image_batch_tensor, f"Error loading: {current_filename}", state["current_index"], total_images)
+
 
     @classmethod
     def IS_CHANGED(s, directory, reset_index):
