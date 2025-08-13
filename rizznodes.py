@@ -1,6 +1,6 @@
 import os
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 import numpy as np
 import trimesh
 from trimesh.proximity import ProximityQuery
@@ -9,6 +9,7 @@ import re
 import gc
 import comfy.model_management as mm
 import folder_paths
+import scipy.ndimage
 
 logging.getLogger('trimesh').setLevel(logging.ERROR)
 
@@ -202,7 +203,6 @@ class RizzBatchImageLoader:
             empty_tensor = torch.zeros((1, 64, 64, 3))
             return (empty_tensor, empty_tensor, "No Images Available", 0, 0)
 
-        # Load all images for the batch output
         batch_images_list = []
         for filename in state["image_files"]:
             image_path = os.path.join(base_dir, filename)
@@ -216,7 +216,6 @@ class RizzBatchImageLoader:
         
         image_batch_tensor = torch.cat(batch_images_list, dim=0) if batch_images_list else torch.zeros((1, 64, 64, 3))
 
-        # Load the single current image for the iterative output
         current_filename = state["image_files"][state["current_index"]]
         current_image_path = os.path.join(base_dir, current_filename)
         try:
@@ -429,6 +428,174 @@ class RizzUpscaleImageBatch:
     def IS_CHANGED(s, images, upscale_model, output_type):
         return float("NaN")
 
+class RizzBlur:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "strength": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 150.0, "step": 0.1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK",)
+    RETURN_NAMES = ("IMAGE", "MASK",)
+    FUNCTION = "blur_masked_area"
+    CATEGORY = "RizzNodes/Image"
+
+    def blur_masked_area(self, image, mask, strength):
+        if strength == 0:
+            return (image, mask)
+
+        processed_images = []
+        for i in range(image.shape[0]):
+            img_tensor = image[i]
+            mask_tensor = mask[i]
+            
+            img_pil = Image.fromarray((img_tensor.cpu().numpy() * 255).astype(np.uint8), 'RGB')
+            mask_pil = Image.fromarray((mask_tensor.cpu().numpy() * 255).astype(np.uint8), 'L')
+
+            blurred_img = img_pil.filter(ImageFilter.GaussianBlur(radius=strength))
+            
+            img_pil.paste(blurred_img, (0,0), mask_pil)
+
+            output_np = np.array(img_pil).astype(np.float32) / 255.0
+            output_tensor = torch.from_numpy(output_np)
+            processed_images.append(output_tensor)
+
+        final_batch = torch.stack(processed_images).to(image.device)
+        return (final_batch, mask)
+
+class RizzCropAndScaleFromMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "target_width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 8}),
+                "target_height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 8}),
+                "padding": ("INT", {"default": 32, "min": 0, "max": 512, "step": 1}),
+                "interpolation": (["bicubic", "bilinear", "nearest"],),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "CROP_DATA")
+    RETURN_NAMES = ("CROPPED_IMAGES", "original_image", "CROP_DATA")
+    FUNCTION = "crop_and_scale"
+    CATEGORY = "RizzNodes/Image/Transform"
+
+    def crop_and_scale(self, image, mask, target_width, target_height, padding, interpolation):
+        batch_size, img_height, img_width, _ = image.shape
+        mask_np = mask.cpu().numpy()
+        image_np = image.cpu().numpy()
+        
+        cropped_images_tensors = []
+        crop_data = []
+
+        pil_interpolation = {
+            "bicubic": Image.BICUBIC, "bilinear": Image.BILINEAR, "nearest": Image.NEAREST
+        }[interpolation]
+        
+        for i in range(batch_size):
+            single_mask = mask_np[i]
+            labeled_mask, num_features = scipy.ndimage.label(single_mask)
+            
+            if num_features == 0:
+                continue
+
+            slices = scipy.ndimage.find_objects(labeled_mask)
+            for slc in slices:
+                y_slice, x_slice = slc
+                
+                y1, y2 = y_slice.start, y_slice.stop
+                x1, x2 = x_slice.start, x_slice.stop
+
+                y1_pad = max(0, y1 - padding)
+                y2_pad = min(img_height, y2 + padding)
+                x1_pad = max(0, x1 - padding)
+                x2_pad = min(img_width, x2 + padding)
+
+                crop_info = {
+                    "original_bbox": [x1_pad, y1_pad, x2_pad, y2_pad],
+                    "original_img_idx": i
+                }
+                crop_data.append(crop_info)
+
+                cropped_np = image_np[i, y1_pad:y2_pad, x1_pad:x2_pad, :]
+                cropped_pil = Image.fromarray((cropped_np * 255).astype(np.uint8))
+                
+                scaled_pil = cropped_pil.resize((target_width, target_height), pil_interpolation)
+                
+                scaled_np = np.array(scaled_pil).astype(np.float32) / 255.0
+                scaled_tensor = torch.from_numpy(scaled_np)
+                cropped_images_tensors.append(scaled_tensor)
+
+        if not cropped_images_tensors:
+            return (torch.zeros((1, target_height, target_width, 3)), image, [])
+
+        final_batch = torch.stack(cropped_images_tensors).to(image.device)
+        return (final_batch, image, crop_data)
+
+
+class RizzPasteAndUnscale:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "original_image": ("IMAGE",),
+                "processed_images": ("IMAGE",),
+                "crop_data": ("CROP_DATA",),
+                "feathering": ("INT", {"default": 64, "min": 0, "max": 512, "step": 1}),
+                "interpolation": (["bicubic", "bilinear", "nearest"],),
+            }
+        }
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "paste_and_unscale"
+    CATEGORY = "RizzNodes/Image/Transform"
+
+    def paste_and_unscale(self, original_image, processed_images, crop_data, feathering, interpolation):
+        if not crop_data:
+            return (original_image,)
+        
+        composited_image = original_image.clone()
+        pil_interpolation = {
+            "bicubic": Image.BICUBIC, "bilinear": Image.BILINEAR, "nearest": Image.NEAREST
+        }[interpolation]
+
+        for i, data in enumerate(crop_data):
+            x1, y1, x2, y2 = data["original_bbox"]
+            original_idx = data["original_img_idx"]
+            
+            w, h = x2 - x1, y2 - y1
+            
+            processed_img_tensor = processed_images[i]
+            processed_pil = Image.fromarray((processed_img_tensor.cpu().numpy() * 255).astype(np.uint8))
+            
+            unscaled_pil = processed_pil.resize((w, h), pil_interpolation)
+            unscaled_tensor = torch.from_numpy(np.array(unscaled_pil).astype(np.float32) / 255.0).to(original_image.device)
+            
+            if feathering > 0:
+                mask = torch.ones(h, w)
+                feather_amount = min(feathering, h // 2, w // 2)
+                if feather_amount > 0:
+                    y_ramp = torch.linspace(0, 1, feather_amount)
+                    x_ramp = torch.linspace(0, 1, feather_amount)
+                    mask[:feather_amount, :] *= y_ramp.unsqueeze(1)
+                    mask[-feather_amount:, :] *= y_ramp.flip(0).unsqueeze(1)
+                    mask[:, :feather_amount] *= x_ramp.unsqueeze(0)
+                    mask[:, -feather_amount:] *= x_ramp.flip(0).unsqueeze(0)
+
+                mask = mask.unsqueeze(-1).to(original_image.device)
+                original_chunk = composited_image[original_idx, y1:y2, x1:x2, :]
+                blended_chunk = original_chunk * (1 - mask) + unscaled_tensor * mask
+                composited_image[original_idx, y1:y2, x1:x2, :] = blended_chunk
+            else:
+                composited_image[original_idx, y1:y2, x1:x2, :] = unscaled_tensor
+        
+        return (composited_image,)
+
 class RizzClean:
     def __init__(self):
         pass
@@ -484,6 +651,9 @@ NODE_CLASS_MAPPINGS = {
     "RizzDynamicPromptGenerator": RizzDynamicPromptGenerator,
     "RizzModelBatchLoader": RizzModelBatchLoader,
     "RizzUpscaleImageBatch": RizzUpscaleImageBatch,
+    "RizzBlur": RizzBlur,
+    "RizzCropAndScaleFromMask": RizzCropAndScaleFromMask,
+    "RizzPasteAndUnscale": RizzPasteAndUnscale,
     "RizzClean": RizzClean,
     "RizzAnything": RizzAnything,
 }
@@ -495,6 +665,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzDynamicPromptGenerator": "Dynamic Prompt Generator",
     "RizzModelBatchLoader": "Batch Model Loader",
     "RizzUpscaleImageBatch": "Batch Upscale Image",
+    "RizzBlur": "Blur (Masked)",
+    "RizzCropAndScaleFromMask": "Crop & Scale from Mask",
+    "RizzPasteAndUnscale": "Paste & Unscale",
     "RizzClean": "Memory Cleaner",
     "RizzAnything": "Anything Passthrough (Reroute)",
 }
