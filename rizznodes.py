@@ -434,8 +434,10 @@ class RizzBlur:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "mask": ("MASK",),
                 "strength": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 150.0, "step": 0.1}),
+            },
+            "optional": {
+                "mask": ("MASK",),
             }
         }
 
@@ -444,28 +446,35 @@ class RizzBlur:
     FUNCTION = "blur_masked_area"
     CATEGORY = "RizzNodes/Image"
 
-    def blur_masked_area(self, image, mask, strength):
+    def blur_masked_area(self, image, strength, mask=None):
         if strength == 0:
-            return (image, mask)
+            output_mask = mask if mask is not None else torch.ones_like(image)[:, :, :, 0]
+            return (image, output_mask)
 
         processed_images = []
         for i in range(image.shape[0]):
             img_tensor = image[i]
-            mask_tensor = mask[i]
-            
             img_pil = Image.fromarray((img_tensor.cpu().numpy() * 255).astype(np.uint8), 'RGB')
-            mask_pil = Image.fromarray((mask_tensor.cpu().numpy() * 255).astype(np.uint8), 'L')
-
+            
             blurred_img = img_pil.filter(ImageFilter.GaussianBlur(radius=strength))
             
-            img_pil.paste(blurred_img, (0,0), mask_pil)
-
-            output_np = np.array(img_pil).astype(np.float32) / 255.0
+            if mask is not None:
+                mask_tensor = mask[i]
+                mask_pil = Image.fromarray((mask_tensor.cpu().numpy() * 255).astype(np.uint8), 'L')
+                img_pil.paste(blurred_img, (0, 0), mask_pil)
+                final_pil = img_pil
+            else:
+                final_pil = blurred_img
+            
+            output_np = np.array(final_pil).astype(np.float32) / 255.0
             output_tensor = torch.from_numpy(output_np)
             processed_images.append(output_tensor)
 
         final_batch = torch.stack(processed_images).to(image.device)
-        return (final_batch, mask)
+        
+        output_mask = mask if mask is not None else torch.ones((image.shape[0], image.shape[1], image.shape[2]), device=image.device)
+        
+        return (final_batch, output_mask)
 
 class RizzCropAndScaleFromMask:
     @classmethod
