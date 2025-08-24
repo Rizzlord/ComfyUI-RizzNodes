@@ -204,31 +204,32 @@ class RizzBatchImageLoader:
             return (empty_tensor, empty_tensor, "No Images Available", 0, 0)
 
         batch_images_list = []
+        target_size = None
         for filename in state["image_files"]:
             image_path = os.path.join(base_dir, filename)
             try:
                 img = Image.open(image_path).convert("RGB")
+                if target_size is None:
+                    target_size = img.size
+                if img.size != target_size:
+                    img = img.resize(target_size, Image.LANCZOS)
+                
                 img_np = np.array(img).astype(np.float32) / 255.0
                 image_tensor = torch.from_numpy(img_np)[None,]
                 batch_images_list.append(image_tensor)
             except Exception as e:
                 print(f"RizzBatchImageLoader Error loading image {image_path} for batch: {e}")
         
-        image_batch_tensor = torch.cat(batch_images_list, dim=0) if batch_images_list else torch.zeros((1, 64, 64, 3))
-
-        current_filename = state["image_files"][state["current_index"]]
-        current_image_path = os.path.join(base_dir, current_filename)
-        try:
-            current_img_pil = Image.open(current_image_path).convert("RGB")
-            current_img_np = np.array(current_img_pil).astype(np.float32) / 255.0
-            current_image_tensor = torch.from_numpy(current_img_np)[None,]
-            
-            print(f"RizzBatchImageLoader: Loaded image {current_filename} (Index: {state['current_index']}/{total_images-1}) for instance {instance_id}")
-            return (current_image_tensor, image_batch_tensor, current_filename, state["current_index"], total_images)
-        except Exception as e:
-            print(f"RizzBatchImageLoader Error loading current image {current_image_path}: {e}")
+        if not batch_images_list:
             empty_tensor = torch.zeros((1, 64, 64, 3))
-            return (empty_tensor, image_batch_tensor, f"Error loading: {current_filename}", state["current_index"], total_images)
+            return (empty_tensor, empty_tensor, "Failed to load any images", state["current_index"], total_images)
+
+        image_batch_tensor = torch.cat(batch_images_list, dim=0)
+        current_filename = state["image_files"][state["current_index"]]
+        current_image_tensor = image_batch_tensor[state["current_index"]].unsqueeze(0)
+
+        print(f"RizzBatchImageLoader: Loaded image {current_filename} (Index: {state['current_index']}/{total_images-1}) for instance {instance_id}")
+        return (current_image_tensor, image_batch_tensor, current_filename, state["current_index"], total_images)
 
 
     @classmethod
