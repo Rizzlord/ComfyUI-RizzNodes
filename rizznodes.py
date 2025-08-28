@@ -22,6 +22,65 @@ any = AnyType("*")
 _NODE_STATE = {}
 
 
+def rgb_to_hsv(arr):
+    """
+    Convert numpy array from RGB to HSV
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    maxc = np.maximum.reduce([r, g, b])
+    minc = np.minimum.reduce([r, g, b])
+    v = maxc
+    s = (maxc - minc) / (maxc + 1e-10)
+    s[maxc == 0] = 0
+    rc = (maxc - r) / (maxc - minc + 1e-10)
+    gc = (maxc - g) / (maxc - minc + 1e-10)
+    bc = (maxc - b) / (maxc - minc + 1e-10)
+    h = np.zeros_like(maxc)
+    mask = maxc == r
+    h[mask] = np.mod(0.0 + (gc - bc)[mask], 6.0)
+    mask = maxc == g
+    h[mask] = 2.0 + (bc - rc)[mask]
+    mask = maxc == b
+    h[mask] = 4.0 + (rc - gc)[mask]
+    h = h / 6.0
+    h = np.mod(h, 1.0)
+    h[np.isnan(h)] = 0.0
+    s[np.isnan(s)] = 0.0
+    return np.stack([h, s, v], axis=-1)
+
+
+def hsv_to_rgb(arr):
+    """
+    Convert numpy array from HSV to RGB
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    h, s, v = arr[..., 0], arr[..., 1], arr[..., 2]
+    h = h * 6.0
+    i = np.floor(h).astype(int)
+    f = h - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - (s * f))
+    t = v * (1.0 - (s * (1.0 - f)))
+    i = np.mod(i, 6)
+    r = np.zeros_like(h)
+    g = np.zeros_like(h)
+    b = np.zeros_like(h)
+    mask = i == 0
+    r[mask], g[mask], b[mask] = v[mask], t[mask], p[mask]
+    mask = i == 1
+    r[mask], g[mask], b[mask] = q[mask], v[mask], p[mask]
+    mask = i == 2
+    r[mask], g[mask], b[mask] = p[mask], v[mask], t[mask]
+    mask = i == 3
+    r[mask], g[mask], b[mask] = p[mask], q[mask], v[mask]
+    mask = i == 4
+    r[mask], g[mask], b[mask] = t[mask], p[mask], v[mask]
+    mask = i == 5
+    r[mask], g[mask], b[mask] = v[mask], p[mask], q[mask]
+    return np.stack([r, g, b], axis=-1)
+
+
 class RizzLoadLatestImage:
     @classmethod
     def INPUT_TYPES(cls):
@@ -654,6 +713,45 @@ class RizzAnything:
     def IS_CHANGED(s, anything):
         return float("NaN")
 
+class RizzEditImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "brightness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "contrast": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "hue": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0}),
+                "saturation": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("IMAGE",)
+    FUNCTION = "edit_image"
+    CATEGORY = "RizzNodes/Image"
+
+    def edit_image(self, image, brightness, contrast, hue, saturation):
+        processed_images = []
+        for img_tensor in image:
+            img_np = img_tensor.cpu().numpy()
+
+            if brightness != 1.0 or contrast != 1.0:
+                img_np = img_np * brightness
+                img_np = (img_np - 0.5) * contrast + 0.5
+                img_np = np.clip(img_np, 0.0, 1.0)
+
+            if hue != 0.0 or saturation != 1.0:
+                hsv = rgb_to_hsv(img_np)
+                hsv[..., 0] = (hsv[..., 0] + hue / 360.0) % 1.0
+                hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0.0, 1.0)
+                img_np = hsv_to_rgb(hsv)
+
+            processed_images.append(torch.from_numpy(img_np))
+
+        final_batch = torch.stack(processed_images).to(image.device)
+        return (final_batch,)
+
 NODE_CLASS_MAPPINGS = {
     "RizzLoadLatestImage": RizzLoadLatestImage,
     "RizzLoadLatestMesh": RizzLoadLatestMesh,
@@ -666,6 +764,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzPasteAndUnscale": RizzPasteAndUnscale,
     "RizzClean": RizzClean,
     "RizzAnything": RizzAnything,
+    "RizzEditImage": RizzEditImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -680,4 +779,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzPasteAndUnscale": "Paste & Unscale",
     "RizzClean": "Memory Cleaner",
     "RizzAnything": "Anything Passthrough (Reroute)",
+    "RizzEditImage": "Edit Image (Brightness/Contrast/Hue/Saturation)",
 }
