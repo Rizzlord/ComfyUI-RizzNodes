@@ -752,6 +752,78 @@ class RizzEditImage:
         final_batch = torch.stack(processed_images).to(image.device)
         return (final_batch,)
 
+class RizzChannelPack:
+    @classmethod
+    def INPUT_TYPES(cls):
+        resolutions = ["auto", 128, 256, 512, 1024, 2048, 4096]
+        return {
+            "required": {},
+            "optional": {
+                "R_Image": ("IMAGE",),
+                "G_Image": ("IMAGE",),
+                "B_Image": ("IMAGE",),
+                "upscale_model": ("UPSCALE_MODEL",),
+                "resolution": (resolutions, {"default": "auto"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("IMAGE",)
+    FUNCTION = "pack_channels"
+    CATEGORY = "RizzNodes/Image"
+
+    def pack_channels(self, R_Image=None, G_Image=None, B_Image=None, upscale_model=None, resolution="auto"):
+        # Determine target dimensions
+        ref_image = next((img for img in [R_Image, G_Image, B_Image] if img is not None), None)
+
+        if resolution == "auto":
+            if ref_image is not None:
+                # For 'auto', create a square resolution based on the reference image's height
+                _, target_res, _, _ = ref_image.shape
+            else:
+                target_res = 512 # Default if no images
+            target_h, target_w = target_res, target_res
+        else:
+            target_h, target_w = resolution, resolution
+
+        # Handle case where all image inputs are None
+        if ref_image is None:
+            packed_image = torch.zeros((1, target_h, target_w, 3), dtype=torch.float32)
+        else:
+            device = ref_image.device
+            black_image = torch.zeros((1, target_h, target_w, 3), dtype=torch.float32, device=device)
+
+            # Assign black image to any None inputs
+            if R_Image is None: R_Image = black_image
+            if G_Image is None: G_Image = black_image
+            if B_Image is None: B_Image = black_image
+
+            images_to_process = [R_Image, G_Image, B_Image]
+            resized_images = []
+
+            for img in images_to_process:
+                # Resize if necessary to match target dimensions
+                if img.shape[1] != target_h or img.shape[2] != target_w:
+                    img_permuted = img.permute(0, 3, 1, 2)
+                    img_resized_permuted = torch.nn.functional.interpolate(img_permuted, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                    resized_images.append(img_resized_permuted.permute(0, 2, 3, 1))
+                else:
+                    resized_images.append(img)
+
+            # Pack channels
+            r_channel = resized_images[0][..., 0]
+            g_channel = resized_images[1][..., 0]
+            b_channel = resized_images[2][..., 0]
+            packed_image = torch.stack([r_channel, g_channel, b_channel], dim=-1)
+
+        # Upscale if model is provided
+        if upscale_model is not None:
+            img_permuted = packed_image.permute(0, 3, 1, 2)
+            upscaled_permuted = upscale_model(img_permuted)
+            packed_image = upscaled_permuted.permute(0, 2, 3, 1)
+
+        return (packed_image,)
+
 NODE_CLASS_MAPPINGS = {
     "RizzLoadLatestImage": RizzLoadLatestImage,
     "RizzLoadLatestMesh": RizzLoadLatestMesh,
@@ -765,6 +837,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzClean": RizzClean,
     "RizzAnything": RizzAnything,
     "RizzEditImage": RizzEditImage,
+    "RizzChannelPack": RizzChannelPack,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -780,4 +853,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzClean": "Memory Cleaner",
     "RizzAnything": "Anything Passthrough (Reroute)",
     "RizzEditImage": "Edit Image (Brightness/Contrast/Hue/Saturation)",
+    "RizzChannelPack": "Channel Pack (Rizz)",
 }
