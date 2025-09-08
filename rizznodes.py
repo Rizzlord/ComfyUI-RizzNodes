@@ -12,7 +12,6 @@ import folder_paths
 import scipy.ndimage
 
 logging.getLogger('trimesh').setLevel(logging.ERROR)
-
 class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
@@ -20,7 +19,6 @@ class AnyType(str):
 any = AnyType("*")
 
 _NODE_STATE = {}
-
 
 def rgb_to_hsv(arr):
     """
@@ -48,7 +46,6 @@ def rgb_to_hsv(arr):
     h[np.isnan(h)] = 0.0
     s[np.isnan(s)] = 0.0
     return np.stack([h, s, v], axis=-1)
-
 
 def hsv_to_rgb(arr):
     """
@@ -79,8 +76,6 @@ def hsv_to_rgb(arr):
     mask = i == 5
     r[mask], g[mask], b[mask] = v[mask], p[mask], q[mask]
     return np.stack([r, g, b], axis=-1)
-
-
 class RizzLoadLatestImage:
     @classmethod
     def INPUT_TYPES(cls):
@@ -773,27 +768,23 @@ class RizzChannelPack:
     CATEGORY = "RizzNodes/Image"
 
     def pack_channels(self, R_Image=None, G_Image=None, B_Image=None, upscale_model=None, resolution="auto"):
-        # Determine target dimensions
         ref_image = next((img for img in [R_Image, G_Image, B_Image] if img is not None), None)
 
         if resolution == "auto":
             if ref_image is not None:
-                # For 'auto', create a square resolution based on the reference image's height
                 _, target_res, _, _ = ref_image.shape
             else:
-                target_res = 512 # Default if no images
+                target_res = 512 
             target_h, target_w = target_res, target_res
         else:
             target_h, target_w = resolution, resolution
 
-        # Handle case where all image inputs are None
         if ref_image is None:
             packed_image = torch.zeros((1, target_h, target_w, 3), dtype=torch.float32)
         else:
             device = ref_image.device
             black_image = torch.zeros((1, target_h, target_w, 3), dtype=torch.float32, device=device)
 
-            # Assign black image to any None inputs
             if R_Image is None: R_Image = black_image
             if G_Image is None: G_Image = black_image
             if B_Image is None: B_Image = black_image
@@ -802,7 +793,6 @@ class RizzChannelPack:
             resized_images = []
 
             for img in images_to_process:
-                # Resize if necessary to match target dimensions
                 if img.shape[1] != target_h or img.shape[2] != target_w:
                     img_permuted = img.permute(0, 3, 1, 2)
                     img_resized_permuted = torch.nn.functional.interpolate(img_permuted, size=(target_h, target_w), mode='bilinear', align_corners=False)
@@ -810,13 +800,11 @@ class RizzChannelPack:
                 else:
                     resized_images.append(img)
 
-            # Pack channels
             r_channel = resized_images[0][..., 0]
             g_channel = resized_images[1][..., 0]
             b_channel = resized_images[2][..., 0]
             packed_image = torch.stack([r_channel, g_channel, b_channel], dim=-1)
 
-        # Upscale if model is provided
         if upscale_model is not None:
             img_permuted = packed_image.permute(0, 3, 1, 2)
             upscaled_permuted = upscale_model(img_permuted)
@@ -837,7 +825,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzClean": RizzClean,
     "RizzAnything": RizzAnything,
     "RizzEditImage": RizzEditImage,
-    "RizzChannelPack": RizzChannelPack,
+    "RizzChannelPack": RizzChannelPack
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
