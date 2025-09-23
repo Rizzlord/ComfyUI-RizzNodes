@@ -2,6 +2,7 @@ import os
 import torch
 from PIL import Image, ImageFilter
 import numpy as np
+import pymeshlab as ml
 import trimesh
 from trimesh.proximity import ProximityQuery
 import logging
@@ -758,6 +759,74 @@ class RizzChannelPack:
 
         return (packed_image,)
 
+def _to_ml_mesh(mesh: trimesh.Trimesh) -> ml.Mesh:
+    return ml.Mesh(
+        vertex_matrix=mesh.vertices.astype(np.float64),
+        face_matrix=mesh.faces.astype(np.int32)
+    )
+
+def _from_ml_mesh(mesh: ml.Mesh) -> trimesh.Trimesh:
+    v = np.array(mesh.vertex_matrix(), dtype=np.float32)
+    f = np.array(mesh.face_matrix(), dtype=np.int64)
+    return trimesh.Trimesh(vertices=v, faces=f, process=False)
+
+class SimplifyMeshNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mesh": ("TRIMESH",),
+                "target_faces": ("INT", {
+                    "default": 80000,
+                    "min": 1000,
+                    "max": 10_000_000,
+                    "step": 1000
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("TRIMESH",)
+    RETURN_NAMES = ("simplified_mesh",)
+    FUNCTION = "simplify"
+    CATEGORY = "Mesh/Processing"
+
+    def simplify(self, mesh, target_faces):
+        face_num = len(mesh.faces)
+        if face_num <= target_faces:
+            print(f"[SimplifyMeshNode] No simplification: {face_num} faces <= {target_faces}")
+            return (mesh.copy(),)
+
+        ms = ml.MeshSet()
+        ms.add_mesh(_to_ml_mesh(mesh), "input")
+
+        for f in ("meshing_remove_duplicate_faces", "meshing_remove_duplicate_vertices", "meshing_remove_unreferenced_vertices"):
+            try:
+                ms.apply_filter(f)
+            except Exception:
+                pass
+
+        try:
+            print("[SimplifyMeshNode] Merging close vertices")
+            ms.apply_filter("meshing_merge_close_vertices")
+        except Exception as e:
+            print(f"[SimplifyMeshNode] merge close vertices failed: {e}")
+
+        # Decimation
+        ms.apply_filter(
+            "meshing_decimation_quadric_edge_collapse",
+            targetfacenum=int(target_faces),
+            preservenormal=True,
+            preservetopology=True,
+            optimalplacement=True,
+            planarweight=0.3,
+            qualitythr=0.5,
+            boundaryweight=1.0,
+        )
+
+        simplified = _from_ml_mesh(ms.current_mesh())
+        print(f"[SimplifyMeshNode] Simplified {face_num} → {len(simplified.faces)} faces (target {target_faces})")
+        return (simplified,)
+
 NODE_CLASS_MAPPINGS = {
     "RizzLoadLatestImage": RizzLoadLatestImage,
     "RizzLoadLatestMesh": RizzLoadLatestMesh,
@@ -770,7 +839,8 @@ NODE_CLASS_MAPPINGS = {
     "RizzPasteAndUnscale": RizzPasteAndUnscale,
     "RizzClean": RizzClean,
     "RizzEditImage": RizzEditImage,
-    "RizzChannelPack": RizzChannelPack
+    "RizzChannelPack": RizzChannelPack,
+    "SimplifyMesh": SimplifyMeshNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -786,4 +856,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzClean": "Memory Cleaner",
     "RizzEditImage": "Edit Image (Brightness/Contrast/Hue/Saturation)",
     "RizzChannelPack": "Channel Pack (Rizz)",
+    "SimplifyMesh": "Simplify Mesh (PyMeshLab)",
 }
