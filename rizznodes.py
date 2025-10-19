@@ -759,6 +759,45 @@ class RizzChannelPack:
 
         return (packed_image,)
 
+class RizzChannelSplit:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "upscale_model": ("UPSCALE_MODEL",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("R_Channel", "G_Channel", "B_Channel")
+    FUNCTION = "split_channels"
+    CATEGORY = "RizzNodes/Image"
+
+    def split_channels(self, image, upscale_model=None):
+        processed_image = image
+
+        if upscale_model is not None and callable(upscale_model):
+            try:
+                img_permuted = image.permute(0, 3, 1, 2)
+                upscaled_permuted = upscale_model(img_permuted)
+                processed_image = upscaled_permuted.permute(0, 2, 3, 1)
+            except Exception as e:
+                print(f"RizzChannelSplit: Error during upscale: {e}")
+                processed_image = image
+        
+        r_channel_data = processed_image[..., 0]
+        g_channel_data = processed_image[..., 1]
+        b_channel_data = processed_image[..., 2]
+
+        r_image = torch.stack([r_channel_data, r_channel_data, r_channel_data], dim=-1)
+        g_image = torch.stack([g_channel_data, g_channel_data, g_channel_data], dim=-1)
+        b_image = torch.stack([b_channel_data, b_channel_data, b_channel_data], dim=-1)
+
+        return (r_image, g_image, b_image,)
+
 def _to_ml_mesh(mesh: trimesh.Trimesh) -> ml.Mesh:
     return ml.Mesh(
         vertex_matrix=mesh.vertices.astype(np.float64),
@@ -811,7 +850,6 @@ class SimplifyMeshNode:
         except Exception as e:
             print(f"[SimplifyMeshNode] merge close vertices failed: {e}")
 
-        # Decimation
         ms.apply_filter(
             "meshing_decimation_quadric_edge_collapse",
             targetfacenum=int(target_faces),
@@ -840,6 +878,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzClean": RizzClean,
     "RizzEditImage": RizzEditImage,
     "RizzChannelPack": RizzChannelPack,
+    "RizzChannelSplit": RizzChannelSplit,
     "SimplifyMesh": SimplifyMeshNode,
 }
 
@@ -856,5 +895,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzClean": "Memory Cleaner",
     "RizzEditImage": "Edit Image (Brightness/Contrast/Hue/Saturation)",
     "RizzChannelPack": "Channel Pack (Rizz)",
+    "RizzChannelSplit": "Channel Split (Rizz)",
     "SimplifyMesh": "Simplify Mesh (PyMeshLab)",
 }
