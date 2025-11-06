@@ -9,6 +9,7 @@ import logging
 import re
 import gc
 import comfy.model_management as mm
+import comfy.utils
 import folder_paths
 import scipy.ndimage
 
@@ -405,6 +406,9 @@ class RizzUpscaleImageBatch:
             "required": {
                 "images": ("IMAGE", ),
                 "upscale_model": ("UPSCALE_MODEL", ),
+                "fixed_resolution": ("BOOLEAN", {"default": False}),
+                "resolution": ([256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096],),
+                "scale_method": (["LANCZOS", "NEAREST"],),
             },
             "optional": {
                 "output_type": (["BATCH", "CONCATENATED_GRID"], {"default": "BATCH"}),
@@ -416,35 +420,62 @@ class RizzUpscaleImageBatch:
     FUNCTION = "upscale_batch"
     CATEGORY = "RizzNodes/Image"
 
-    def upscale_batch(self, images, upscale_model, output_type):
+    def upscale_batch(self, images, upscale_model, fixed_resolution, resolution, scale_method, output_type):
         upscaled_images_list = []
         if not callable(upscale_model):
             return (torch.zeros(64, 64, 3)[None,],)
+
+        # Determine the PIL resampling filter
+        resampling_filter = Image.LANCZOS if scale_method == "LANCZOS" else Image.NEAREST
+
+        pbar = comfy.utils.ProgressBar(len(images))
         for i, image_tensor in enumerate(images):
             if image_tensor.dim() == 3:
                 image_tensor = image_tensor.unsqueeze(0)
-            image_tensor = image_tensor.to(dtype=torch.float32).permute(0, 3, 1, 2)
+            
+            image_tensor_permuted = image_tensor.to(dtype=torch.float32).permute(0, 3, 1, 2)
+            
             try:
-                upscaled = upscale_model(image_tensor)
+                upscaled = upscale_model(image_tensor_permuted)
+                
+                if fixed_resolution:
+                    # Convert to PIL Image for resizing
+                    upscaled_pil = Image.fromarray((upscaled.permute(0, 2, 3, 1).squeeze(0).cpu().numpy() * 255).astype(np.uint8))
+                    target_resolution = (resolution, resolution)
+                    
+                    # Resize with the selected filter
+                    resized_pil = upscaled_pil.resize(target_resolution, resampling_filter)
+                    
+                    # Convert back to tensor
+                    resized_np = np.array(resized_pil).astype(np.float32) / 255.0
+                    upscaled = torch.from_numpy(resized_np).unsqueeze(0).permute(0, 3, 1, 2).to(image_tensor.device)
+
                 upscaled_images_list.append(upscaled)
+
             except Exception as e:
-                upscaled_images_list.append(torch.zeros_like(image_tensor))
+                upscaled_images_list.append(torch.zeros_like(image_tensor_permuted))
+            pbar.update(1)
+
         if not upscaled_images_list:
             return (torch.zeros(64, 64, 3)[None,],)
+
         if output_type == "CONCATENATED_GRID":
-            first_h = upscaled_images_list[0].shape[1]
-            if all(img.shape[1] == first_h for img in upscaled_images_list):
-                final_output = torch.cat(upscaled_images_list, dim=2)
-            else:
-                max_w = max(img.shape[2] for img in upscaled_images_list)
-                padded = [torch.nn.functional.pad(img, (0, max_w - img.shape[2], 0, 0)) for img in upscaled_images_list]
-                final_output = torch.cat(padded, dim=1)
-            return (final_output,)
+            # This part might need adjustment depending on how you want to handle grids of different sizes
+            # For now, let's assume we're making them the same height before concatenating
+            max_h = max(img.shape[2] for img in upscaled_images_list)
+            padded_images = []
+            for img in upscaled_images_list:
+                pad_h = max_h - img.shape[2]
+                padded_img = torch.nn.functional.pad(img, (0, 0, 0, pad_h)) # Pad height
+                padded_images.append(padded_img)
+            final_output = torch.cat(padded_images, dim=3) # Concatenate horizontally
+            return (final_output.permute(0, 2, 3, 1),)
+
         final_output = torch.cat(upscaled_images_list, dim=0).permute(0, 2, 3, 1)
         return (final_output,)
 
     @classmethod
-    def IS_CHANGED(s, images, upscale_model, output_type):
+    def IS_CHANGED(s, images, upscale_model, fixed_resolution, resolution, scale_method, output_type):
         return float("NaN")
 
 class RizzBlur:
