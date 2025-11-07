@@ -190,8 +190,8 @@ class RizzBatchImageLoader:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "INT", "INT",)
-    RETURN_NAMES = ("CURRENT_IMAGE", "IMAGE_BATCH", "CURRENT_FILENAME", "CURRENT_INDEX", "TOTAL_IMAGES",)
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT",)
+    RETURN_NAMES = ("CURRENT_IMAGE", "CURRENT_MASK", "IMAGE_BATCH", "MASK_BATCH", "CURRENT_FILENAME", "CURRENT_INDEX", "TOTAL_IMAGES",)
     FUNCTION = "load_next_image"
     CATEGORY = "RizzNodes/Image"
 
@@ -215,8 +215,9 @@ class RizzBatchImageLoader:
         
         if not state["image_files"]:
             if not os.path.isdir(base_dir):
-                empty_tensor = torch.zeros((1, 64, 64, 3))
-                return (empty_tensor, empty_tensor, "Directory Not Found", 0, 0)
+                empty_image = torch.zeros((1, 64, 64, 3))
+                empty_mask = torch.zeros((1, 64, 64))
+                return (empty_image, empty_mask, empty_image, empty_mask, "Directory Not Found", 0, 0)
 
             valid_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
             try:
@@ -225,11 +226,13 @@ class RizzBatchImageLoader:
                     if f.lower().endswith(valid_extensions) and os.path.isfile(os.path.join(base_dir, f))
                 ])
                 if not state["image_files"]:
-                    empty_tensor = torch.zeros((1, 64, 64, 3))
-                    return (empty_tensor, empty_tensor, "No Images Found", 0, 0)
+                    empty_image = torch.zeros((1, 64, 64, 3))
+                    empty_mask = torch.zeros((1, 64, 64))
+                    return (empty_image, empty_mask, empty_image, empty_mask, "No Images Found", 0, 0)
             except Exception as e:
-                empty_tensor = torch.zeros((1, 64, 64, 3))
-                return (empty_tensor, empty_tensor, f"Error listing directory: {e}", 0, 0)
+                empty_image = torch.zeros((1, 64, 64, 3))
+                empty_mask = torch.zeros((1, 64, 64))
+                return (empty_image, empty_mask, empty_image, empty_mask, f"Error listing directory: {e}", 0, 0)
 
         total_images = len(state["image_files"])
         state["current_index"] += 1
@@ -237,15 +240,17 @@ class RizzBatchImageLoader:
             state["current_index"] = 0
 
         if total_images == 0:
-            empty_tensor = torch.zeros((1, 64, 64, 3))
-            return (empty_tensor, empty_tensor, "No Images Available", 0, 0)
+            empty_image = torch.zeros((1, 64, 64, 3))
+            empty_mask = torch.zeros((1, 64, 64))
+            return (empty_image, empty_mask, empty_image, empty_mask, "No Images Available", 0, 0)
 
         batch_images_list = []
+        batch_masks_list = []
         target_size = None
         for filename in state["image_files"]:
             image_path = os.path.join(base_dir, filename)
             try:
-                img = Image.open(image_path).convert("RGB")
+                img = Image.open(image_path).convert("RGBA")
                 if target_size is None:
                     target_size = img.size
                 if img.size != target_size:
@@ -253,19 +258,28 @@ class RizzBatchImageLoader:
                 
                 img_np = np.array(img).astype(np.float32) / 255.0
                 image_tensor = torch.from_numpy(img_np)[None,]
-                batch_images_list.append(image_tensor)
+                
+                rgb_tensor = image_tensor[:, :, :, :3]
+                mask_tensor = image_tensor[:, :, :, 3]
+
+                batch_images_list.append(rgb_tensor)
+                batch_masks_list.append(mask_tensor)
             except Exception as e:
                 print(f"RizzBatchImageLoader Error loading image {image_path} for batch: {e}")
         
         if not batch_images_list:
-            empty_tensor = torch.zeros((1, 64, 64, 3))
-            return (empty_tensor, empty_tensor, "Failed to load any images", state["current_index"], total_images)
+            empty_image = torch.zeros((1, 64, 64, 3))
+            empty_mask = torch.zeros((1, 64, 64))
+            return (empty_image, empty_mask, empty_image, empty_mask, "Failed to load any images", state["current_index"], total_images)
 
         image_batch_tensor = torch.cat(batch_images_list, dim=0)
+        mask_batch_tensor = torch.cat(batch_masks_list, dim=0)
+
         current_filename = state["image_files"][state["current_index"]]
         current_image_tensor = image_batch_tensor[state["current_index"]].unsqueeze(0)
+        current_mask_tensor = mask_batch_tensor[state["current_index"]].unsqueeze(0)
 
-        return (current_image_tensor, image_batch_tensor, current_filename, state["current_index"], total_images)
+        return (current_image_tensor, current_mask_tensor, image_batch_tensor, mask_batch_tensor, current_filename, state["current_index"], total_images)
 
 
     @classmethod
