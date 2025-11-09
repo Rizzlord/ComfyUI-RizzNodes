@@ -540,6 +540,77 @@ class RizzBlur:
         
         return (final_batch, output_mask)
 
+class RizzAlphaMargin:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "alpha_threshold": ("FLOAT", {
+                    "default": 0.01,
+                    "min": 0.0,
+                    "max": 0.2,
+                    "step": 0.001
+                }),
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("IMAGE", "MASK")
+    FUNCTION = "extend_colors"
+    CATEGORY = "RizzNodes/Image"
+
+    def extend_colors(self, image, alpha_threshold, mask=None):
+        image_np = image.detach().cpu().numpy().astype(np.float32, copy=False)
+        device = image.device
+
+        if mask is not None:
+            mask_np = mask.detach().cpu().numpy().astype(np.float32, copy=False)
+        else:
+            if image_np.shape[-1] == 4:
+                mask_np = image_np[..., 3]
+                image_np = image_np[..., :3]
+            else:
+                h, w = image_np.shape[1:3]
+                mask_np = np.ones((image_np.shape[0], h, w), dtype=np.float32)
+
+        if mask_np.ndim == 4:
+            mask_np = np.squeeze(mask_np, axis=-1)
+
+        processed = []
+        for i in range(image_np.shape[0]):
+            filled = self._extend_single(image_np[i, :, :, :3], mask_np[i], alpha_threshold)
+            processed.append(torch.from_numpy(filled))
+
+        output_image = torch.stack(processed).to(device)
+        output_mask = torch.from_numpy(mask_np.astype(np.float32)).to(device)
+        return (output_image, output_mask)
+
+    @staticmethod
+    def _extend_single(rgb, alpha_mask, alpha_threshold):
+        rgb_data = rgb.copy().astype(np.float32, copy=False)
+        mask = (alpha_mask > alpha_threshold)
+
+        if not np.any(mask):
+            return rgb_data
+        if np.all(mask):
+            return rgb_data
+
+        missing = ~mask
+        _, indices = scipy.ndimage.distance_transform_edt(missing, return_indices=True)
+
+        nearest_y = indices[0][missing]
+        nearest_x = indices[1][missing]
+
+        for channel in range(rgb_data.shape[-1]):
+            channel_data = rgb_data[:, :, channel]
+            channel_data[missing] = channel_data[nearest_y, nearest_x]
+
+        return rgb_data
+
 class RizzCropAndScaleFromMask:
     @classmethod
     def INPUT_TYPES(s):
@@ -918,6 +989,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzModelBatchLoader": RizzModelBatchLoader,
     "RizzUpscaleImageBatch": RizzUpscaleImageBatch,
     "RizzBlur": RizzBlur,
+    "RizzAlphaMargin": RizzAlphaMargin,
     "RizzCropAndScaleFromMask": RizzCropAndScaleFromMask,
     "RizzPasteAndUnscale": RizzPasteAndUnscale,
     "RizzClean": RizzClean,
@@ -935,6 +1007,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzModelBatchLoader": "Batch Model Loader",
     "RizzUpscaleImageBatch": "Batch Upscale Image",
     "RizzBlur": "Blur (Masked)",
+    "RizzAlphaMargin": "Alpha Margin Fill",
     "RizzCropAndScaleFromMask": "Crop & Scale from Mask",
     "RizzPasteAndUnscale": "Paste & Unscale",
     "RizzClean": "Memory Cleaner",
