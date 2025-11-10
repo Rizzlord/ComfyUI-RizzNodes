@@ -425,71 +425,169 @@ class RizzUpscaleImageBatch:
                 "scale_method": (["LANCZOS", "NEAREST"],),
             },
             "optional": {
+                "masks": ("MASK",),
                 "output_type": (["BATCH", "CONCATENATED_GRID"], {"default": "BATCH"}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("UPSCALE_IMAGES",)
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("UPSCALED_IMAGE", "UPSCALED_MASK")
     FUNCTION = "upscale_batch"
     CATEGORY = "RizzNodes/Image"
 
-    def upscale_batch(self, images, upscale_model, fixed_resolution, resolution, scale_method, output_type):
-        upscaled_images_list = []
-        if not callable(upscale_model):
-            return (torch.zeros(64, 64, 3)[None,],)
+    def upscale_batch(self, images, upscale_model, fixed_resolution, resolution, scale_method, masks=None, output_type="BATCH"):
+        def _normalize_mask_batch(mask_batch):
+            if mask_batch.dim() == 4:
+                if mask_batch.shape[1] == 1:
+                    mask_batch = mask_batch[:, 0, :, :]
+                elif mask_batch.shape[-1] == 1:
+                    mask_batch = mask_batch[..., 0]
+            if mask_batch.dim() == 2:
+                return mask_batch.unsqueeze(0)
+            if mask_batch.dim() == 3:
+                return mask_batch
+            raise ValueError("Masks tensor must have 2, 3, or 4 dimensions.")
 
-        # Determine the PIL resampling filter
+        def _resize_mask(mask_tensor, target_h, target_w, device):
+            mask_ready = mask_tensor
+            while mask_ready.dim() > 2 and mask_ready.shape[0] == 1:
+                mask_ready = mask_ready.squeeze(0)
+            if mask_ready.dim() > 2 and mask_ready.shape[-1] == 1:
+                mask_ready = mask_ready.squeeze(-1)
+            if mask_ready.dim() != 2:
+                raise ValueError("Each mask must resolve to a 2D tensor (H, W).")
+            mask_ready = mask_ready.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32)
+            resized = torch.nn.functional.interpolate(mask_ready, size=(target_h, target_w), mode="nearest")
+            return resized[:, 0, :, :]
+
+        def _finalize_image_output(tensor, keep_batch):
+            if not keep_batch and tensor.dim() == 4 and tensor.shape[0] == 1:
+                return tensor[0]
+            return tensor
+
+        def _finalize_mask_output(tensor, keep_batch):
+            if not keep_batch and tensor.dim() == 3 and tensor.shape[0] == 1:
+                return tensor[0]
+            return tensor
+
+        if not callable(upscale_model):
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+            return (empty_image, empty_mask)
+
+        if not isinstance(images, torch.Tensor):
+            raise ValueError("Images input must be a torch.Tensor.")
+
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+        elif images.dim() != 4:
+            raise ValueError("Images tensor must have 3 or 4 dimensions.")
+
+        images = images.to(dtype=torch.float32)
+        num_images = images.shape[0]
+
+        if num_images == 0:
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+            return (empty_image, empty_mask)
+
+        device = images.device
+
+        if masks is not None:
+            if not isinstance(masks, torch.Tensor):
+                raise ValueError("Masks input must be a torch.Tensor when provided.")
+            masks = _normalize_mask_batch(masks)
+            if masks.shape[0] != num_images:
+                raise ValueError("Number of masks must match number of images.")
+            masks = masks.to(device=device, dtype=torch.float32)
+
         resampling_filter = Image.LANCZOS if scale_method == "LANCZOS" else Image.NEAREST
 
-        pbar = comfy.utils.ProgressBar(len(images))
-        for i, image_tensor in enumerate(images):
-            if image_tensor.dim() == 3:
-                image_tensor = image_tensor.unsqueeze(0)
-            
+        upscaled_images_list = []
+        upscaled_masks_list = []
+
+        pbar = comfy.utils.ProgressBar(num_images)
+        for idx in range(num_images):
+            image_tensor = images[idx].unsqueeze(0)
             image_tensor_permuted = image_tensor.to(dtype=torch.float32).permute(0, 3, 1, 2)
-            
+            mask_slice = masks[idx] if masks is not None else None
+
             try:
                 upscaled = upscale_model(image_tensor_permuted)
-                
+                if not isinstance(upscaled, torch.Tensor):
+                    raise ValueError("Upscale model must return a torch.Tensor.")
+
+                if upscaled.dim() == 3:
+                    upscaled = upscaled.unsqueeze(0)
+
                 if fixed_resolution:
-                    # Convert to PIL Image for resizing
-                    upscaled_pil = Image.fromarray((upscaled.permute(0, 2, 3, 1).squeeze(0).cpu().numpy() * 255).astype(np.uint8))
+                    upscaled_np = upscaled.permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()
+                    upscaled_np = np.clip(upscaled_np, 0.0, 1.0)
+                    upscaled_pil = Image.fromarray((upscaled_np * 255).astype(np.uint8))
                     target_resolution = (resolution, resolution)
-                    
-                    # Resize with the selected filter
                     resized_pil = upscaled_pil.resize(target_resolution, resampling_filter)
-                    
-                    # Convert back to tensor
                     resized_np = np.array(resized_pil).astype(np.float32) / 255.0
                     upscaled = torch.from_numpy(resized_np).unsqueeze(0).permute(0, 3, 1, 2).to(image_tensor.device)
-
-                upscaled_images_list.append(upscaled)
+                else:
+                    upscaled = upscaled.to(image_tensor.device, dtype=torch.float32)
 
             except Exception as e:
-                upscaled_images_list.append(torch.zeros_like(image_tensor_permuted))
+                print(f"RizzUpscaleImageBatch: Error during upscale: {e}")
+                upscaled = torch.zeros_like(image_tensor_permuted)
+            upscaled_images_list.append(upscaled)
+
+            target_h = upscaled.shape[2]
+            target_w = upscaled.shape[3]
+
+            if mask_slice is not None:
+                try:
+                    mask_resized = _resize_mask(mask_slice, target_h, target_w, image_tensor.device)
+                except Exception as mask_error:
+                    print(f"RizzUpscaleImageBatch: Error resizing mask: {mask_error}")
+                    mask_resized = torch.ones((1, target_h, target_w), device=image_tensor.device, dtype=torch.float32)
+            else:
+                mask_resized = torch.ones((1, target_h, target_w), device=image_tensor.device, dtype=torch.float32)
+
+            upscaled_masks_list.append(mask_resized)
             pbar.update(1)
 
         if not upscaled_images_list:
-            return (torch.zeros(64, 64, 3)[None,],)
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+            return (empty_image, empty_mask)
+
+        return_as_batch = (output_type == "BATCH") and (num_images > 1)
 
         if output_type == "CONCATENATED_GRID":
-            # This part might need adjustment depending on how you want to handle grids of different sizes
-            # For now, let's assume we're making them the same height before concatenating
             max_h = max(img.shape[2] for img in upscaled_images_list)
             padded_images = []
+            padded_masks = []
             for img in upscaled_images_list:
                 pad_h = max_h - img.shape[2]
-                padded_img = torch.nn.functional.pad(img, (0, 0, 0, pad_h)) # Pad height
+                padded_img = torch.nn.functional.pad(img, (0, 0, 0, pad_h))
                 padded_images.append(padded_img)
-            final_output = torch.cat(padded_images, dim=3) # Concatenate horizontally
-            return (final_output.permute(0, 2, 3, 1),)
+            for mask in upscaled_masks_list:
+                pad_h = max_h - mask.shape[1]
+                mask_expanded = mask.unsqueeze(1)
+                padded_mask = torch.nn.functional.pad(mask_expanded, (0, 0, 0, pad_h))
+                padded_masks.append(padded_mask)
+            final_image = torch.cat(padded_images, dim=3).permute(0, 2, 3, 1)
+            final_mask = torch.cat(padded_masks, dim=3).squeeze(1)
+            return (
+                _finalize_image_output(final_image, keep_batch=False),
+                _finalize_mask_output(final_mask, keep_batch=False),
+            )
 
-        final_output = torch.cat(upscaled_images_list, dim=0).permute(0, 2, 3, 1)
-        return (final_output,)
+        final_images = torch.cat(upscaled_images_list, dim=0).permute(0, 2, 3, 1)
+        final_masks = torch.cat(upscaled_masks_list, dim=0)
+
+        return (
+            _finalize_image_output(final_images, keep_batch=return_as_batch),
+            _finalize_mask_output(final_masks, keep_batch=return_as_batch),
+        )
 
     @classmethod
-    def IS_CHANGED(s, images, upscale_model, fixed_resolution, resolution, scale_method, output_type):
+    def IS_CHANGED(s, images, upscale_model, fixed_resolution, resolution, scale_method, masks=None, output_type="BATCH"):
         return float("NaN")
 
 class RizzBlur:
