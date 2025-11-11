@@ -879,6 +879,12 @@ class RizzEditImage:
                 "contrast": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "hue": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0}),
                 "saturation": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "flip_horizontal": ("BOOLEAN", {"default": False}),
+                "flip_vertical": ("BOOLEAN", {"default": False}),
+                "flip_mode": (["none", "horizontal", "vertical", "both"], {"default": "none"}),
+                "invert_colors": ("BOOLEAN", {"default": False}),
+                "rotate_image": ("BOOLEAN", {"default": False}),
+                "rotation_angle": (["90", "180", "270"], {"default": "90"}),
             }
         }
 
@@ -887,7 +893,35 @@ class RizzEditImage:
     FUNCTION = "edit_image"
     CATEGORY = "RizzNodes/Image"
 
-    def edit_image(self, image, brightness, contrast, hue, saturation):
+    def edit_image(
+        self,
+        image,
+        brightness,
+        contrast,
+        hue,
+        saturation,
+        flip_horizontal=False,
+        flip_vertical=False,
+        flip_mode="none",
+        invert_colors=False,
+        rotate_image=False,
+        rotation_angle="90",
+    ):
+        normalized_flip_mode = flip_mode.lower() if isinstance(flip_mode, str) else "none"
+        apply_flip_horizontal = flip_horizontal
+        apply_flip_vertical = flip_vertical
+
+        if normalized_flip_mode == "horizontal":
+            apply_flip_horizontal, apply_flip_vertical = True, False
+        elif normalized_flip_mode == "vertical":
+            apply_flip_horizontal, apply_flip_vertical = False, True
+        elif normalized_flip_mode == "both":
+            apply_flip_horizontal, apply_flip_vertical = True, True
+
+        rotation_steps = {"90": 1, "180": 2, "270": 3}
+        rotation_key = str(rotation_angle)
+        rotate_times = rotation_steps.get(rotation_key, 0)
+
         processed_images = []
         for img_tensor in image:
             img_np = img_tensor.cpu().numpy()
@@ -903,6 +937,19 @@ class RizzEditImage:
                 hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0.0, 1.0)
                 img_np = hsv_to_rgb(hsv)
 
+            if invert_colors:
+                img_np = 1.0 - img_np
+
+            if apply_flip_horizontal:
+                img_np = np.flip(img_np, axis=1)
+
+            if apply_flip_vertical:
+                img_np = np.flip(img_np, axis=0)
+
+            if rotate_image and rotate_times:
+                img_np = np.rot90(img_np, k=rotate_times)
+
+            img_np = np.ascontiguousarray(img_np)
             processed_images.append(torch.from_numpy(img_np))
 
         final_batch = torch.stack(processed_images).to(image.device)
