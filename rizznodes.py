@@ -22,26 +22,40 @@ any = AnyType("*")
 
 _NODE_STATE = {}
 
+
+def _natural_sort_key(value: str):
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", value)
+    ]
+
 def rgb_to_hsv(arr):
     arr = np.asarray(arr, dtype=np.float32)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    maxc = np.maximum.reduce([r, g, b])
-    minc = np.minimum.reduce([r, g, b])
-    v = maxc
-    s = (maxc - minc) / (maxc + 1e-10)
-    s[maxc == 0] = 0
-    rc = (maxc - r) / (maxc - minc + 1e-10)
-    gc = (maxc - g) / (maxc - minc + 1e-10)
-    bc = (maxc - b) / (maxc - minc + 1e-10)
+    r = arr[..., 0]
+    g = arr[..., 1]
+    b = arr[..., 2]
+
+    maxc = np.max(arr, axis=-1)
+    minc = np.min(arr, axis=-1)
+    delta = maxc - minc
+
     h = np.zeros_like(maxc)
-    mask = maxc == r
-    h[mask] = np.mod(0.0 + (gc - bc)[mask], 6.0)
-    mask = maxc == g
-    h[mask] = 2.0 + (bc - rc)[mask]
-    mask = maxc == b
-    h[mask] = 4.0 + (rc - gc)[mask]
-    h = h / 6.0
-    h = np.mod(h, 1.0)
+    mask = delta > 1e-10
+
+    r_mask = mask & (maxc == r)
+    g_mask = mask & (maxc == g)
+    b_mask = mask & (maxc == b)
+
+    h[r_mask] = np.mod(((g - b)[r_mask] / delta[r_mask]), 6.0)
+    h[g_mask] = ((b - r)[g_mask] / delta[g_mask]) + 2.0
+    h[b_mask] = ((r - g)[b_mask] / delta[b_mask]) + 4.0
+    h = (h / 6.0) % 1.0
+
+    s = np.zeros_like(maxc)
+    nonzero = maxc > 1e-10
+    s[nonzero] = delta[nonzero] / maxc[nonzero]
+
+    v = maxc
     h[np.isnan(h)] = 0.0
     s[np.isnan(s)] = 0.0
     return np.stack([h, s, v], axis=-1)
@@ -211,7 +225,7 @@ class RizzBatchImageLoader:
             state["last_directory"] = directory
             state["image_files"] = []
 
-        base_dir = folder_paths.get_input_directory() if not os.path.isabs(directory) else directory
+        base_dir = directory if os.path.isabs(directory) else os.path.join(folder_paths.get_input_directory(), directory)
         
         if not state["image_files"]:
             if not os.path.isdir(base_dir):
@@ -224,7 +238,7 @@ class RizzBatchImageLoader:
                 state["image_files"] = sorted([
                     f for f in os.listdir(base_dir)
                     if f.lower().endswith(valid_extensions) and os.path.isfile(os.path.join(base_dir, f))
-                ])
+                ], key=_natural_sort_key)
                 if not state["image_files"]:
                     empty_image = torch.zeros((1, 64, 64, 3))
                     empty_mask = torch.zeros((1, 64, 64))
