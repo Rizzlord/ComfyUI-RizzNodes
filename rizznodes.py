@@ -505,7 +505,28 @@ class RizzUpscaleImageBatch:
             empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
             return (empty_image, empty_mask)
 
-        device = images.device
+        inference_context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
+        descriptor_mode = all([
+            hasattr(upscale_model, "model"),
+            hasattr(upscale_model, "scale"),
+            hasattr(upscale_model, "to"),
+        ])
+        descriptor_device = None
+        descriptor_scale = None
+        adaptive_tile = 512
+        tile_overlap = 32
+
+        if descriptor_mode:
+            descriptor_device = mm.get_torch_device()
+            descriptor_scale = float(getattr(upscale_model, "scale", 1.0))
+            try:
+                memory_required = mm.module_size(upscale_model.model)
+            except Exception:
+                memory_required = 0
+            memory_required += (512 * 512 * 3) * images.element_size() * max(descriptor_scale, 1.0) * 384.0
+            memory_required += images.nelement() * images.element_size()
+            mm.free_memory(memory_required, descriptor_device)
+            upscale_model.to(descriptor_device)
 
         if masks is not None:
             if not isinstance(masks, torch.Tensor):
@@ -513,7 +534,7 @@ class RizzUpscaleImageBatch:
             masks = _normalize_mask_batch(masks)
             if masks.shape[0] != num_images:
                 raise ValueError("Number of masks must match number of images.")
-            masks = masks.to(device=device, dtype=torch.float32)
+            masks = masks.to(device=images.device, dtype=torch.float32)
 
         resampling_filter = Image.LANCZOS if scale_method == "LANCZOS" else Image.NEAREST
 
@@ -527,29 +548,53 @@ class RizzUpscaleImageBatch:
             mask_slice = masks[idx] if masks is not None else None
 
             try:
-                upscaled = upscale_model(image_tensor_permuted)
-                if not isinstance(upscaled, torch.Tensor):
-                    raise ValueError("Upscale model must return a torch.Tensor.")
-
-                if upscaled.dim() == 3:
-                    upscaled = upscaled.unsqueeze(0)
-
-                if fixed_resolution:
-                    upscaled_np = upscaled.permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()
-                    upscaled_np = np.clip(upscaled_np, 0.0, 1.0)
-                    upscaled_pil = Image.fromarray((upscaled_np * 255).astype(np.uint8))
-                    target_resolution = (resolution, resolution)
-                    resized_pil = upscaled_pil.resize(target_resolution, resampling_filter)
-                    resized_np = np.array(resized_pil).astype(np.float32) / 255.0
-                    upscaled = torch.from_numpy(resized_np).unsqueeze(0).permute(0, 3, 1, 2).to(image_tensor.device)
+                upscaled_device = image_tensor.device
+                if descriptor_mode:
+                    chw_tensor = image_tensor_permuted.to(device=descriptor_device, dtype=torch.float32)
+                    current_tile = adaptive_tile
+                    while True:
+                        try:
+                            tiled = comfy.utils.tiled_scale(
+                                chw_tensor,
+                                lambda a: upscale_model(a),
+                                tile_x=current_tile,
+                                tile_y=current_tile,
+                                overlap=tile_overlap,
+                                upscale_amount=descriptor_scale,
+                                output_device=descriptor_device,
+                                pbar=None,
+                            )
+                            adaptive_tile = current_tile
+                            upscaled = torch.clamp(tiled, 0.0, 1.0)
+                            break
+                        except mm.OOM_EXCEPTION as oom_error:
+                            current_tile //= 2
+                            if current_tile < 128:
+                                raise oom_error
+                    upscaled_device = descriptor_device
                 else:
+                    with inference_context():
+                        upscaled = upscale_model(image_tensor_permuted)
+                    if not isinstance(upscaled, torch.Tensor):
+                        raise ValueError("Upscale model must return a torch.Tensor.")
+
+                    if upscaled.dim() == 3:
+                        upscaled = upscaled.unsqueeze(0)
+
                     upscaled = upscaled.to(image_tensor.device, dtype=torch.float32)
+                    upscaled_device = upscaled.device
 
             except Exception as e:
                 print(f"RizzUpscaleImageBatch: Error during upscale: {e}")
                 upscaled = torch.zeros_like(image_tensor_permuted)
-            upscaled_images_list.append(upscaled)
-
+            if fixed_resolution:
+                upscaled_np = upscaled.permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()
+                upscaled_np = np.clip(upscaled_np, 0.0, 1.0)
+                upscaled_pil = Image.fromarray((upscaled_np * 255).astype(np.uint8))
+                target_resolution = (resolution, resolution)
+                resized_pil = upscaled_pil.resize(target_resolution, resampling_filter)
+                resized_np = np.array(resized_pil).astype(np.float32) / 255.0
+                upscaled = torch.from_numpy(resized_np).unsqueeze(0).permute(0, 3, 1, 2).to(image_tensor.device)
             target_h = upscaled.shape[2]
             target_w = upscaled.shape[3]
 
@@ -562,13 +607,30 @@ class RizzUpscaleImageBatch:
             else:
                 mask_resized = torch.ones((1, target_h, target_w), device=image_tensor.device, dtype=torch.float32)
 
-            upscaled_masks_list.append(mask_resized)
+            upscaled_device = upscaled.device
+            upscaled_cpu = upscaled.detach().to("cpu", dtype=torch.float32)
+            upscaled_images_list.append(upscaled_cpu)
+            del upscaled
+
+            mask_resized_cpu = mask_resized.detach().to("cpu", dtype=torch.float32)
+            upscaled_masks_list.append(mask_resized_cpu)
+            del mask_resized
+
+            if (not descriptor_mode) and upscaled_device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
             pbar.update(1)
 
         if not upscaled_images_list:
             empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
             empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
             return (empty_image, empty_mask)
+
+        if descriptor_mode:
+            upscale_model.to("cpu")
+            try:
+                mm.soft_empty_cache()
+            except Exception:
+                pass
 
         return_as_batch = (output_type == "BATCH") and (num_images > 1)
 
