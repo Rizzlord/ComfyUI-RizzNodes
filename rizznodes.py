@@ -12,6 +12,7 @@ import comfy.model_management as mm
 import comfy.utils
 import folder_paths
 import scipy.ndimage
+from typing import List, Optional
 
 logging.getLogger('trimesh').setLevel(logging.ERROR)
 class AnyType(str):
@@ -1135,6 +1136,352 @@ class RizzChannelSplit:
 
         return (r_image, g_image, b_image,)
 
+class SaveMultiviewImages:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "path": ("STRING", {"default": "multiview_bake"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("path",)
+    FUNCTION = "save"
+    CATEGORY = "RizzNodes/Multiview"
+    OUTPUT_NODE = True
+
+    def save(self, images, path):
+        output_dir = folder_paths.get_output_directory()
+        full_path = os.path.join(output_dir, path)
+
+        counter = 1
+        while os.path.exists(f"{full_path}_{counter:05}_"):
+            counter += 1
+        
+        final_path = f"{full_path}_{counter:05}_"
+        os.makedirs(final_path, exist_ok=True)
+
+        for i, image_tensor in enumerate(images):
+            img_pil = Image.fromarray((image_tensor.cpu().numpy() * 255).astype(np.uint8))
+            img_pil.save(os.path.join(final_path, f"MV_{i+1}.png"))
+            
+        return (final_path,)
+
+class LoadMultiviewImages:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "path": ("STRING", {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("images", "masks")
+    FUNCTION = "load"
+    CATEGORY = "RizzNodes/Multiview"
+
+    def load(self, path):
+        if not os.path.exists(path):
+            output_dir = folder_paths.get_output_directory()
+            potential_path = os.path.join(output_dir, path)
+            if os.path.exists(potential_path):
+                path = potential_path
+            else:
+                raise FileNotFoundError(f"Path does not exist: {path}")
+
+        def _extract_index(file_name):
+            stem = os.path.splitext(file_name)[0]
+            match = re.search(r'(\d+)(?:_*)$', stem)
+            if not match:
+                return None
+            return int(match.group(1))
+
+        image_entries = []
+        for fname in os.listdir(path):
+            if not fname.lower().endswith(".png"):
+                continue
+            if 'mask' in os.path.splitext(fname)[0].lower():
+                continue
+            idx = _extract_index(fname)
+            if idx is None:
+                continue
+            image_entries.append((idx, fname))
+
+        if not image_entries:
+            raise FileNotFoundError(
+                f"No numbered multiview images found in {path}. "
+                "Name files with a trailing number like 'front_1.png'..'side_12.png'."
+            )
+
+        image_entries.sort(key=lambda item: item[0])
+
+        available_indices = {idx for idx, _ in image_entries}
+        if not available_indices:
+            raise FileNotFoundError(f"No multiview images with numeric suffixes found in {path}")
+
+        def _build_mask_map():
+            mask_map = {}
+            for fname in os.listdir(path):
+                if not fname.lower().endswith(".png"):
+                    continue
+                stem_lower = os.path.splitext(fname)[0].lower()
+                if 'mask' not in stem_lower:
+                    continue
+                idx = _extract_index(fname)
+                if idx is None:
+                    continue
+                mask_map[idx] = os.path.join(path, fname)
+            return mask_map
+
+        mask_map = _build_mask_map()
+
+        images = []
+        masks = []
+
+        for idx, file_name in image_entries:
+            img_path = os.path.join(path, file_name)
+            raw_img = Image.open(img_path)
+            alpha_channel = None
+            if 'A' in raw_img.getbands():
+                alpha_channel = np.array(raw_img.getchannel('A')).astype(np.float32) / 255.0
+            img_rgb = raw_img.convert("RGB")
+            img_np = np.array(img_rgb).astype(np.float32) / 255.0
+            img_tensor = torch.from_numpy(img_np)
+            images.append(img_tensor)
+
+            mask_tensor = None
+
+            mask_path = mask_map.get(idx)
+            if mask_path:
+                mask_img = Image.open(mask_path)
+                if mask_img.mode != 'L':
+                    mask_img = mask_img.convert('L')
+                if mask_img.size != img_rgb.size:
+                    mask_img = mask_img.resize(img_rgb.size, Image.NEAREST)
+                mask_np = np.array(mask_img).astype(np.float32) / 255.0
+                mask_tensor = torch.from_numpy(mask_np)
+            elif alpha_channel is not None:
+                mask_tensor = torch.from_numpy(alpha_channel.astype(np.float32))
+            else:
+                default_mask = np.ones(img_tensor.shape[:2], dtype=np.float32)
+                mask_tensor = torch.from_numpy(default_mask)
+
+            masks.append(mask_tensor)
+
+        images_tensor = torch.stack(images)
+        masks_tensor = torch.stack(masks)
+        return (images_tensor, masks_tensor)
+
+class BatchImagesToGrid:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "rows": ("INT", {"default": 2, "min": 1, "max": 16}),
+                "cols": ("INT", {"default": 2, "min": 1, "max": 16}),
+                "order": ("STRING", {"default": ""}),
+                "fill_r": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "fill_g": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "fill_b": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+            "optional": {
+                "masks": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("grid_image", "grid_mask")
+    FUNCTION = "create_grid"
+    CATEGORY = "RizzNodes/Multiview"
+
+    def create_grid(self, images, rows, cols, order, fill_r, fill_g, fill_b, masks=None):
+        if images is None:
+            return (images, masks)
+
+        batch, height, width, channels = images.shape
+
+        if batch == 0:
+            raise ValueError("At least one image is required to build a grid")
+
+        if channels != 3:
+            pass 
+
+        device = images.device
+        dtype = images.dtype
+
+        total_cells = rows * cols
+        usable = min(batch, total_cells)
+
+        grid_height = rows * height
+        grid_width = cols * width
+
+        fill_color = torch.tensor([fill_r, fill_g, fill_b], device=device, dtype=dtype).clamp(0.0, 1.0)
+        
+        if channels == 4:
+             fill_color = torch.cat([fill_color, torch.tensor([1.0], device=device, dtype=dtype)])
+
+        grid_image = fill_color.view(1, 1, 1, channels).expand(1, grid_height, grid_width, channels).clone()
+        grid_mask = torch.zeros((1, grid_height, grid_width), dtype=dtype, device=device)
+
+        order_indices: Optional[List[int]] = None
+        if order:
+            if not isinstance(order, str):
+                raise TypeError("order input must be a string")
+            parts = [token for token in re.split(r"[,\s_-]+", order.strip()) if token]
+            if parts:
+                parsed: List[int] = []
+                for token in parts:
+                    try:
+                        parsed.append(int(token))
+                    except ValueError as err:
+                        raise ValueError(f"unable to parse '{token}' as an integer in order input") from err
+
+                use_one_based = parsed and min(parsed) >= 1 and all(value >= 1 for value in parsed)
+                if use_one_based:
+                    parsed = [value - 1 for value in parsed]
+
+                seen = set()
+                normalized: List[int] = []
+                for idx in parsed:
+                    if idx < 0:
+                        raise ValueError("order values must not be negative")
+                    if idx >= batch:
+                        raise ValueError("order value exceeds the number of input images")
+                    if idx in seen:
+                        raise ValueError("order values must not contain duplicates")
+                    seen.add(idx)
+                    normalized.append(idx)
+
+                remainder = [idx for idx in range(batch) if idx not in seen]
+                order_indices = normalized + remainder
+
+        placement_order = (order_indices or list(range(batch)))[:usable]
+
+        for tile_idx, image_idx in enumerate(placement_order):
+            row = tile_idx // cols
+            col = tile_idx % cols
+            y0 = row * height
+            y1 = y0 + height
+            x0 = col * width
+            x1 = x0 + width
+            grid_image[0, y0:y1, x0:x1, :] = images[image_idx]
+            
+            if masks is not None:
+                # Handle mask batch
+                # Masks are usually (B, H, W)
+                if image_idx < masks.shape[0]:
+                     grid_mask[0, y0:y1, x0:x1] = masks[image_idx]
+                else:
+                     # If mask batch is smaller than image batch (unlikely but possible), fill with 1s?
+                     grid_mask[0, y0:y1, x0:x1] = 1.0
+            else:
+                # If no masks provided, assume full opacity for the image area
+                grid_mask[0, y0:y1, x0:x1] = 1.0
+
+        return (grid_image, grid_mask)
+
+class SplitImageBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "rows": ("INT", {"default": 2, "min": 1, "max": 16}),
+                "cols": ("INT", {"default": 2, "min": 1, "max": 16}),
+            },
+            "optional": {
+                "masks": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("images", "masks")
+    FUNCTION = "degrid"
+    CATEGORY = "RizzNodes/Multiview"
+
+    def degrid(self, images, rows, cols, masks=None):
+        if images is None:
+            return (images, masks)
+
+        batch, height, width, channels = images.shape
+
+        if batch == 0:
+            raise ValueError("at least one grid image is required")
+
+        if height % rows != 0 or width % cols != 0:
+            # Resize image to be divisible
+            new_h = height - (height % rows)
+            new_w = width - (width % cols)
+            
+            # Alternatively, resize to nearest multiple? 
+            # Or just warn? 
+            # User workflow: Grid -> Generator -> Split. Generator might output standard res (e.g. 1024x1024).
+            # If grid was 3x2, 1024 is not divisible by 3.
+            # Let's resize to the closest multiple that preserves aspect ratio roughly, or just exact fit.
+            # Simplest is to resize to exactly (height // rows * rows, width // cols * cols) but that might cut pixels.
+            # Better: Resize to (height, width) where height is multiple of rows.
+            # Actually, if the generator changed the size, we probably want to just split it evenly.
+            # So we can just use integer division and ignore the remainder, OR resize the image to be perfectly divisible.
+            # Resizing is safer to avoid losing edge pixels if the mismatch is small.
+            
+            # Let's resize to the nearest multiple.
+            target_h = round(height / rows) * rows
+            target_w = round(width / cols) * cols
+            
+            if target_h == 0: target_h = rows
+            if target_w == 0: target_w = cols
+            
+            # We need to resize the batch of images
+            # images is (B, H, W, C)
+            # Permute to (B, C, H, W) for interpolate
+            img_p = images.permute(0, 3, 1, 2)
+            img_p = torch.nn.functional.interpolate(img_p, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            images = img_p.permute(0, 2, 3, 1)
+            
+            # Update dimensions
+            batch, height, width, channels = images.shape
+            
+            if masks is not None:
+                 # Resize masks too
+                 mask_p = masks.unsqueeze(1) # (B, 1, H, W)
+                 mask_p = torch.nn.functional.interpolate(mask_p, size=(target_h, target_w), mode='nearest')
+                 masks = mask_p.squeeze(1)
+
+        tile_h = height // rows
+        tile_w = width // cols
+
+        tiles = []
+        mask_tiles = []
+        
+        for b in range(batch):
+            grid_image = images[b]
+            grid_mask = masks[b] if masks is not None else None
+            
+            for row in range(rows):
+                y0 = row * tile_h
+                y1 = y0 + tile_h
+                for col in range(cols):
+                    x0 = col * tile_w
+                    x1 = x0 + tile_w
+                    tile = grid_image[y0:y1, x0:x1, :].unsqueeze(0)
+                    tiles.append(tile)
+                    
+                    if grid_mask is not None:
+                        mask_tile = grid_mask[y0:y1, x0:x1].unsqueeze(0)
+                        mask_tiles.append(mask_tile)
+                    else:
+                        # If no mask provided, create a full white mask for the tile
+                        mask_tile = torch.ones((1, tile_h, tile_w), dtype=images.dtype, device=images.device)
+                        mask_tiles.append(mask_tile)
+
+        output = torch.cat(tiles, dim=0)
+        output_masks = torch.cat(mask_tiles, dim=0)
+        return (output, output_masks)
+
 def _to_ml_mesh(mesh: trimesh.Trimesh) -> ml.Mesh:
     return ml.Mesh(
         vertex_matrix=mesh.vertices.astype(np.float64),
@@ -1202,6 +1549,27 @@ class SimplifyMeshNode:
         print(f"[SimplifyMeshNode] Simplified {face_num} → {len(simplified.faces)} faces (target {target_faces})")
         return (simplified,)
 
+
+
+class VideoSecondsToLength:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "seconds": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 1000.0, "step": 0.1}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
+            }
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("length",)
+    FUNCTION = "convert"
+    CATEGORY = "RizzNodes/Utils"
+
+    def convert(self, seconds, fps):
+        length = int(seconds * fps) + 1
+        return (length,)
+
 NODE_CLASS_MAPPINGS = {
     "RizzLoadLatestImage": RizzLoadLatestImage,
     "RizzLoadLatestMesh": RizzLoadLatestMesh,
@@ -1218,6 +1586,11 @@ NODE_CLASS_MAPPINGS = {
     "RizzChannelPack": RizzChannelPack,
     "RizzChannelSplit": RizzChannelSplit,
     "SimplifyMesh": SimplifyMeshNode,
+    "SaveMultiviewImages": SaveMultiviewImages,
+    "LoadMultiviewImages": LoadMultiviewImages,
+    "BatchImagesToGrid": BatchImagesToGrid,
+    "SplitImageBatch": SplitImageBatch,
+    "VideoSecondsToLength": VideoSecondsToLength,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1236,4 +1609,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzChannelPack": "Channel Pack (Rizz)",
     "RizzChannelSplit": "Channel Split (Rizz)",
     "SimplifyMesh": "Simplify Mesh (PyMeshLab)",
+    "SaveMultiviewImages": "Save Multiview Images",
+    "LoadMultiviewImages": "Load Multiview Images",
+    "BatchImagesToGrid": "Batch Images to Grid",
+    "SplitImageBatch": "Split Image Batch",
+    "VideoSecondsToLength": "Video Seconds to Length",
 }
