@@ -1136,6 +1136,29 @@ class RizzChannelSplit:
 
         return (r_image, g_image, b_image,)
 
+class CreateImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "width": ("INT", {"default": 512, "min": 8, "max": 8192, "step": 8}),
+                "height": ("INT", {"default": 512, "min": 8, "max": 8192, "step": 8}),
+                "color": (["white", "black"], {"default": "white"}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("IMAGE", "MASK")
+    FUNCTION = "create"
+    CATEGORY = "RizzNodes/Image"
+
+    def create(self, width, height, color, batch_size):
+        fill_value = 1.0 if color == "white" else 0.0
+        image = torch.full((batch_size, height, width, 3), fill_value, dtype=torch.float32)
+        mask = torch.ones((batch_size, height, width), dtype=torch.float32)
+        return (image, mask)
+
 class SaveMultiviewImages:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1585,6 +1608,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzEditImage": RizzEditImage,
     "RizzChannelPack": RizzChannelPack,
     "RizzChannelSplit": RizzChannelSplit,
+    "CreateImage": CreateImage,
     "SimplifyMesh": SimplifyMeshNode,
     "SaveMultiviewImages": SaveMultiviewImages,
     "LoadMultiviewImages": LoadMultiviewImages,
@@ -1608,6 +1632,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzEditImage": "Edit Image (Brightness/Contrast/Hue/Saturation)",
     "RizzChannelPack": "Channel Pack (Rizz)",
     "RizzChannelSplit": "Channel Split (Rizz)",
+    "CreateImage": "Create Image",
     "SimplifyMesh": "Simplify Mesh (PyMeshLab)",
     "SaveMultiviewImages": "Save Multiview Images",
     "LoadMultiviewImages": "Load Multiview Images",
