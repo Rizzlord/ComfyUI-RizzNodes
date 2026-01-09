@@ -60,6 +60,7 @@ def load_safetensors_gds(ckpt, device, compat_mode=False):
             start, end = info['data_offsets']
             
             # Map dtype
+            # We use getattr to safely check for newer types
             dtype_map = {
                 "F16": torch.float16,
                 "BF16": torch.bfloat16,
@@ -69,14 +70,42 @@ def load_safetensors_gds(ckpt, device, compat_mode=False):
                 "I16": torch.int16,
                 "I8": torch.int8,
                 "U8": torch.uint8,
-                "BOOL": torch.bool
+                "BOOL": torch.bool,
+                "F8_E4M3": getattr(torch, 'float8_e4m3fn', None),
+                "F8_E5M2": getattr(torch, 'float8_e5m2', None),
+                "F8_E4M3FN": getattr(torch, 'float8_e4m3fn', None),
+                "F8_E4M3FNUZ": getattr(torch, 'float8_e4m3fnuz', None),
+                "F8_E5M2FNUZ": getattr(torch, 'float8_e5m2fnuz', None),
+                "F4_E2M1": getattr(torch, 'float4_e2m1', None),
+                "F4_E3M0": getattr(torch, 'float4_e3m0', None),
             }
             
-            if dtype_str not in dtype_map:
-                # logging.warning(f"RizzNodes GDS: Unsupported dtype {dtype_str} for tensor {tensor_name}")
-                continue
+            pt_dtype = dtype_map.get(dtype_str)
+            
+            # Special Handling for FP8 if PyTorch lacks support
+            # ComfyUI often loads FP8 as raw bytes (uint8) if native support is missing, 
+            # then casts it later or uses Triton/Bitsandbytes kernels.
+            # So if F8 is requested but missing, we try loading as UINT8.
+            if pt_dtype is None and dtype_str.startswith("F8"):
+                pt_dtype = torch.uint8
+            
+            if pt_dtype is None:
+                # Fallback check for quantized types
+                if dtype_str.startswith("Q") or "4" in dtype_str:
+                     print(f"### RizzNodes WARNING: Experimental/Quantized dtype '{dtype_str}' detected. Falling back. ###")
+                     return _original_load_torch_file(ckpt, device=device)
                 
-            pt_dtype = dtype_map[dtype_str]
+                print(f"### RizzNodes WARNING: Unsupported GDS dtype '{dtype_str}' for tensor '{tensor_name}'. Skipping! ###")
+                continue
+            
+            # Create empty tensor on GPU
+            tensor = torch.empty(size=shape, dtype=pt_dtype, device=device)
+            
+            # Read directly into tensor buffer
+            f_cu.read(tensor, file_offset=data_start + start)
+            
+            state_dict[tensor_name] = tensor
+
             
             # Create empty tensor on GPU
             tensor = torch.empty(size=shape, dtype=pt_dtype, device=device)
@@ -91,7 +120,7 @@ def load_safetensors_gds(ckpt, device, compat_mode=False):
         
     return state_dict
 
-def load_torch_file_gds(ckpt, safe_load=False, device=None, return_metadata=False, compat_mode=False):
+def load_torch_file_gds(ckpt, safe_load=False, device=None, return_metadata=False, compat_mode=False, verbose=False, force_gds=False):
     """
     Patched version of load_torch_file that attempts to use GDS (GPUDirect Storage)
     via kvikio if available.
@@ -99,14 +128,36 @@ def load_torch_file_gds(ckpt, safe_load=False, device=None, return_metadata=Fals
     if device is None:
         device = torch.device("cpu")
     
-    # Try GDS for safetensors on CUDA
-    if GDS_AVAILABLE and device.type == "cuda" and (ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft")):
+    # Determine if we can use GDS
+    use_gds = False
+    loading_device = device
+
+    # Only applicable for safetensors
+    if GDS_AVAILABLE and (ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft")):
+        if device.type == "cuda":
+            use_gds = True
+        elif force_gds and device.type == "cpu" and torch.cuda.is_available():
+            # Force GDS means: Load to GPU (GDS), then move to CPU
+            use_gds = True
+            loading_device = torch.device("cuda")
+
+    if use_gds:
         try:
             if verbose:
-                print(f"### RizzNodes: GDS DMA Transfer Starting for {os.path.basename(ckpt)} ###")
+                mode_str = "Direct" if loading_device == device else "Staged (GPU->CPU)"
+                print(f"### RizzNodes: GDS Start ({mode_str}) for {os.path.basename(ckpt)} -> {loading_device} ###")
 
-            sd = load_safetensors_gds(ckpt, device, compat_mode=compat_mode)
+            sd = load_safetensors_gds(ckpt, loading_device, compat_mode=compat_mode)
             
+            # If we loaded to GPU but wanted CPU, move them now
+            if loading_device != device:
+                if verbose:
+                    print(f"### RizzNodes: Moving {len(sd)} tensors to CPU... ###")
+                for k, v in sd.items():
+                    sd[k] = v.to(device)
+                # Optional: Clear GPU cache after heavy staging
+                torch.cuda.empty_cache()
+
             # Safetensors metadata extraction
             metadata = None
             if return_metadata:
@@ -141,6 +192,10 @@ class RizzGDSPatcher:
                     "default": True, 
                     "tooltip": "Enable or disable the GDS patch. When enabled, attempts to load safetensors directly to GPU memory."
                 }),
+                "force_gds": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Force GDS even for CPU loads. This loads file -> GPU (via GDS) -> CPU. Can speed up loading if NVMe-GPU link is faster than system IO, but uses VRAM temporarily."
+                }),
                 "compat_mode": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Enable KvikIO compatibility mode. Use this if you encounter errors or if GDS is not fully configured on your system (posix fallback)."
@@ -163,7 +218,7 @@ class RizzGDSPatcher:
     FUNCTION = "patch"
     CATEGORY = "RizzNodes/System"
 
-    def patch(self, enable, compat_mode, verbose, model=None, clip=None, vae=None, anything=None):
+    def patch(self, enable, force_gds, compat_mode, verbose, model=None, clip=None, vae=None, anything=None):
         global _original_load_torch_file
         
         if enable:
@@ -171,11 +226,19 @@ class RizzGDSPatcher:
                 print(f"### RizzNodes: Patching GDS. Kvikio available: {GDS_AVAILABLE} ###")
             
             def patched_loader(*args, **kwargs):
+                # Check device if present in args or kwargs to debug
+                dev = "unknown"
+                if len(args) > 2:
+                    dev = args[2]
+                elif "device" in kwargs:
+                    dev = kwargs["device"]
+                
                 if verbose:
                     fname = args[0] if args else "unknown"
-                    print(f"### RizzNodes: Intercepted load for {os.path.basename(str(fname))} ###")
-                # Pass compat_mode to the loader
-                return load_torch_file_gds(*args, **kwargs, compat_mode=compat_mode)
+                    print(f"### RizzNodes: Intercepted load for {os.path.basename(str(fname))} (Requesting: {dev}) ###")
+                
+                # Pass params to the loader
+                return load_torch_file_gds(*args, **kwargs, compat_mode=compat_mode, verbose=verbose, force_gds=force_gds)
                 
             comfy.utils.load_torch_file = patched_loader
             
