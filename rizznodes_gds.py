@@ -105,15 +105,6 @@ def load_safetensors_gds(ckpt, device, compat_mode=False):
             f_cu.read(tensor, file_offset=data_start + start)
             
             state_dict[tensor_name] = tensor
-
-            
-            # Create empty tensor on GPU
-            tensor = torch.empty(size=shape, dtype=pt_dtype, device=device)
-            
-            # Read directly into tensor buffer
-            f_cu.read(tensor, file_offset=data_start + start)
-            
-            state_dict[tensor_name] = tensor
             
     finally:
         f_cu.close()
