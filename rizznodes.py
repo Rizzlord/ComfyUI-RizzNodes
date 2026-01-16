@@ -1593,6 +1593,42 @@ class VideoSecondsToLength:
         length = int(seconds * fps) + 1
         return (length,)
 
+class RizzTextcombine:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text1": ("STRING", {"multiline": True, "default": ""}),
+                "text2": ("STRING", {"multiline": True, "default": ""}),
+                "text3": ("STRING", {"multiline": True, "default": ""}),
+                "text4": ("STRING", {"multiline": True, "default": ""}),
+                "text5": ("STRING", {"multiline": True, "default": ""}),
+                "separator": (["space", ",", ".", "-", "/"], {"default": "space"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("combined_text",)
+    FUNCTION = "combine_text"
+    CATEGORY = "RizzNodes/Text"
+
+    def combine_text(self, text1, text2, text3, text4, text5, separator):
+        texts = [text1, text2, text3, text4, text5]
+        
+        sep_map = {
+            "space": " ",
+            ",": ",",
+            ".": ".",
+            "-": "-",
+            "/": "/"
+        }
+        
+        sep_char = sep_map.get(separator, " ")
+        
+        non_empty_texts = [t for t in texts if t != ""]
+        
+        return (sep_char.join(non_empty_texts),)
+
 NODE_CLASS_MAPPINGS = {
     "RizzLoadLatestImage": RizzLoadLatestImage,
     "RizzLoadLatestMesh": RizzLoadLatestMesh,
@@ -1615,6 +1651,7 @@ NODE_CLASS_MAPPINGS = {
     "BatchImagesToGrid": BatchImagesToGrid,
     "SplitImageBatch": SplitImageBatch,
     "VideoSecondsToLength": VideoSecondsToLength,
+    "RizzTextcombine": RizzTextcombine,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1639,4 +1676,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BatchImagesToGrid": "Batch Images to Grid",
     "SplitImageBatch": "Split Image Batch",
     "VideoSecondsToLength": "Video Seconds to Length",
+    "RizzTextcombine": "Rizz Text Combine",
 }
