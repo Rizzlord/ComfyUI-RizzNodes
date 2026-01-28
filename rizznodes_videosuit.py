@@ -1146,6 +1146,242 @@ class RizzExtractAllFrames:
 
 
 # ============================================================================
+# Node 8: RizzEditClips
+# ============================================================================
+
+MAX_VIDEO_SLOTS = 25
+
+class RizzEditClips:
+    """Combine and trim video clips.
+    - If 1 clip: trim start/end.
+    - If multiple: trim start of first, end of last, concatenate all.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = {
+            "required": {
+                "video_count": ("INT", {
+                    "default": 1, "min": 1, "max": MAX_VIDEO_SLOTS, "step": 1,
+                    "tooltip": "Number of video clips to combine."
+                }),
+                "trim_start": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1,
+                    "tooltip": "Seconds to trim from the START of the 1st clip."
+                }),
+                "trim_end": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1,
+                    "tooltip": "Seconds to trim from the END of the LAST clip (0 = no trim from end)."
+                }),
+            },
+            "optional": {}
+        }
+        
+        # Dynamic inputs
+        for i in range(1, MAX_VIDEO_SLOTS + 1):
+             inputs["optional"][f"video_{i}"] = ("VIDEO",)
+             
+        return inputs
+    
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "edit_clips"
+    CATEGORY = "RizzNodes/Video"
+    
+    def edit_clips(self, video_count, trim_start=0.0, trim_end=0.0, **kwargs):
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        output_path = os.path.join(temp_dir, f"rizz_edit_{uuid.uuid4().hex}.mp4")
+        
+        # Collect video inputs
+        video_inputs = []
+        for i in range(1, video_count + 1):
+            vid = kwargs.get(f"video_{i}")
+            if vid:
+                video_inputs.append(vid)
+                
+        if not video_inputs:
+            raise ValueError("No video inputs provided.")
+            
+        # Determine common properties (use first video as reference)
+        ref_video = video_inputs[0]
+        # We might need to scale everything to ref dimensions? 
+        # For simplicity, we assume user provides matching resolutions or we let ffmpeg handle/scale.
+        # But `concat` filter usually requires matching resolution/fps.
+        # To be safe, we will normalize all clips to the resolution of the first clip using scale filter.
+        width = ref_video['width']
+        height = ref_video['height']
+        fps = ref_video.get('fps', 24.0)
+        has_audio = any(v.get('has_audio', False) for v in video_inputs)
+        
+        cmd = ['ffmpeg', '-y']
+        
+        # Add inputs
+        for v in video_inputs:
+            cmd.extend(['-i', v['path']])
+            
+        filter_complex = []
+        
+        concat_v_parts = []
+        concat_a_parts = []
+        
+        for idx, vid in enumerate(video_inputs):
+            # Input labels
+            in_v = f"{idx}:v"
+            in_a = f"{idx}:a"
+            
+            out_v = f"v{idx}"
+            out_a = f"a{idx}"
+            
+            # Prepare trim logic
+            # Start trim applies only to idx == 0
+            # End trim applies only to idx == last
+            
+            start_cut = 0.0
+            end_cut = 0.0 # 0 means "duration - trim_end"
+            
+            duration = vid['duration']
+            
+            if idx == 0:
+                start_cut = trim_start
+                
+            if idx == len(video_inputs) - 1:
+                # Calculate end time: duration - trim_end
+                # Ensure we don't trim past start
+                target_duration = duration - (start_cut if idx == 0 else 0) - trim_end
+                if target_duration < 0.1:
+                    target_duration = 0.1 # Minimum duration safety
+                    print(f"[RizzNodes] Warning: trim settings would result in empty clip {idx+1}. Clamping to 0.1s.")
+                    
+                # For trim filter, "end" is the timestamp
+                # If idx==0 and idx==last (single clip), end time is duration - trim_end
+                # But start_cut is absolute time.
+                
+                # logic:
+                # trim=start=START:duration=DURATION
+                # or trim=start=START:end=END
+                
+                # To be simpler:
+                # Start trim: trim=start=trim_start
+                # End trim: trim=end=(duration - trim_end)
+                
+                end_time_abs = duration - trim_end
+                if end_time_abs <= start_cut:
+                    end_time_abs = start_cut + 0.1
+                
+                # If trim_end is 0, we don't need 'end=' usually, but explicit is fine.
+                target_end = end_time_abs
+            else:
+                target_end = duration
+            
+            # Build filter chain for this segment
+            # 1. Scale to match reference width/height (force)
+            # 2. Trim
+            # 3. SETPTS
+            
+            filters_chain = []
+            
+            # Scale
+            filters_chain.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
+            
+            # Trim
+            trim_args = []
+            if start_cut > 0:
+                trim_args.append(f"start={start_cut}")
+            if idx == len(video_inputs) - 1 and trim_end > 0:
+                 trim_args.append(f"end={target_end}")
+            
+            if trim_args:
+                filters_chain.append(f"trim={':'.join(trim_args)}")
+            
+            # Reset PTS is crucial after trim
+            filters_chain.append("setpts=PTS-STARTPTS")
+            
+            # Construct the filter string
+            filter_str = ",".join(filters_chain)
+            filter_complex.append(f"[{in_v}]{filter_str}[{out_v}]")
+            concat_v_parts.append(f"[{out_v}]")
+            
+            # AUDIO Processing
+            # We must provide audio for every segment if we want the output to have audio
+            # If a clip is missing audio, we generate silence
+            
+            if has_audio:
+                if vid.get('has_audio', False):
+                    # Trim audio matching video
+                    atrim_args = []
+                    if start_cut > 0:
+                        atrim_args.append(f"start={start_cut}")
+                    if idx == len(video_inputs) - 1 and trim_end > 0:
+                        atrim_args.append(f"end={target_end}")
+                    
+                    afilter = []
+                    if atrim_args:
+                        afilter.append(f"atrim={':'.join(atrim_args)}")
+                    afilter.append("asetpts=PTS-STARTPTS")
+                    
+                    filter_complex.append(f"[{in_a}]{','.join(afilter)}[{out_a}]")
+                    concat_a_parts.append(f"[{out_a}]")
+                else:
+                    # Generate silence with same duration as TRIMMED video
+                    # We know the duration of the current trimmed segment is:
+                    # target_end - start_cut
+                    
+                    seg_duration = target_end - start_cut
+                    # Safety check for minimal duration
+                    if seg_duration < 0.1: seg_duration = 0.1
+                    
+                    # Generate silence
+                    # anullsrc -> atrim -> asetpts
+                    silence_label = f"silence{idx}"
+                    filter_complex.append(f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration={seg_duration}[{silence_label}]")
+                    concat_a_parts.append(f"[{silence_label}]")
+        
+        # Determine if we can do audio concat
+        # Now we forced audio for all parts if has_audio is true
+        do_audio = has_audio and len(concat_a_parts) == len(video_inputs)
+        
+        # Concat filter
+        # Interleave inputs: [v0][a0][v1][a1]... for concat filter
+        concat_inputs = []
+        for i in range(len(video_inputs)):
+            concat_inputs.append(concat_v_parts[i])
+            if do_audio:
+                concat_inputs.append(concat_a_parts[i])
+                
+        filter_complex.append(f"{''.join(concat_inputs)}concat=n={len(video_inputs)}:v=1:a={1 if do_audio else 0}[vout]{'[aout]' if do_audio else ''}")
+        
+        cmd.extend(['-filter_complex', ";".join(filter_complex)])
+        cmd.extend(['-map', '[vout]'])
+        if do_audio:
+            cmd.extend(['-map', '[aout]'])
+            
+        # Encoding output
+        cmd.extend([
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+        ])
+        if do_audio:
+            cmd.extend(['-c:a', 'aac', '-b:a', '192k'])
+            
+        cmd.append(output_path)
+        
+        # Run
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                print(f"[RizzNodes] EditClips FFmpeg error: {result.stderr}")
+                # Fallback? No, complex filter failure is hard to fallback from.
+                raise RuntimeError(f"FFmpeg Error: {result.stderr[:500]}")
+                
+            return (get_video_info(output_path),)
+            
+        except Exception as e:
+            print(f"[RizzNodes] Error in EditClips: {e}")
+            raise e
+
+
+# ============================================================================
 # Node Mappings
 # ============================================================================
 
@@ -1157,6 +1393,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzPreviewVideo": RizzPreviewVideo,
     "RizzSeparateVideoAudio": RizzSeparateVideoAudio,
     "RizzExtractAllFrames": RizzExtractAllFrames,
+    "RizzEditClips": RizzEditClips,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1167,5 +1404,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzPreviewVideo": "📺 Preview Video (Rizz)",
     "RizzSeparateVideoAudio": "🔊 Separate Video/Audio",
     "RizzExtractAllFrames": "🎞️ Extract ALL Frames (Batch)",
+    "RizzEditClips": "✂️ Edit & Combine Clips (Rizz)",
 }
 
