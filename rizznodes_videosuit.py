@@ -494,9 +494,13 @@ class RizzVideoEffects:
                     # Calculate number of tiles needed to cover the video
                     tiles_x = math.ceil(width / target_w)
                     tiles_y = math.ceil(height / target_h)
+                    total_tiles = tiles_x * tiles_y
                     
+                    # tile filter expects N frames to create a grid. We have 1 frame (the image).
+                    # We need to loop the single frame total_tiles-1 times to feed the tile filter.
                     scale_filter = (
                         f"[{input_idx}:v]"
+                        f"loop=loop={total_tiles-1}:size=1:start=0,"
                         f"scale={target_w}:{target_h},"
                         f"tile={tiles_x}x{tiles_y},"
                         f"crop={width}:{height}:0:0,"
@@ -532,7 +536,27 @@ class RizzVideoEffects:
                     complex_filter.append(f"[{current_label}][{ovr_label}]overlay={overlay_pos}:format=auto[{out_label}]")
                 else:
                     # Blend mode requires same-size inputs, pad if needed
-                    complex_filter[-1] = f"{scale_filter},colorchannelmixer=aa={opacity},pad={width}:{height}:0:0:color=black@0[{ovr_label}]"
+                    # When using blend modes, 'overlay' filter is not used, so we must position via 'pad'
+                    # Extract x and y expressions from overlay_pos (e.g. "x=(W-w)/2:y=(H-h)/2")
+                    # pad syntax: width:height:x:y:color
+                    
+                    pad_x = "0"
+                    pad_y = "0"
+                    if "x=" in overlay_pos:
+                        parts = overlay_pos.split(":")
+                        for p in parts:
+                            if p.startswith("x="):
+                                pad_x = p[2:]
+                            if p.startswith("y="):
+                                pad_y = p[2:]
+                    
+                    # In pad filter, iw/ih refer to the input (image), ow/oh refer to output (video size)
+                    # Our overlay_pos expressions use W/H (video) and w/h (image)
+                    # We need to map W->ow, H->oh, w->iw, h->ih for pad filter expressions
+                    pad_x = pad_x.replace("W", "ow").replace("H", "oh").replace("w", "iw").replace("h", "ih")
+                    pad_y = pad_y.replace("W", "ow").replace("H", "oh").replace("w", "iw").replace("h", "ih")
+                    
+                    complex_filter[-1] = f"{scale_filter},colorchannelmixer=aa={opacity},pad={width}:{height}:{pad_x}:{pad_y}:color=black@0[{ovr_label}]"
                     complex_filter.append(f"[{current_label}][{ovr_label}]blend=all_mode={ffmpeg_blend}:all_opacity={opacity}[{out_label}]")
                 
                 current_label = out_label
@@ -621,6 +645,19 @@ class RizzVideoEffects:
                 cmd.extend(['-map', '0:a'])
         elif filters:
             cmd.extend(['-vf', ','.join(filters)])
+            
+        # Duration handling
+        # If end_with_audio is False, we CUT the video/audio at the exact video duration
+        # If end_with_audio is True, we let ffmpeg run (it will extend to longest stream if we used 'longest' in amix)
+        # Note: amix 'longest' keeps audio going. Video stream behavior depends on inputs.
+        # But if we want to ensure video cut-off, we must use -t.
+        
+        if not end_with_audio:
+            # Force output duration to match processed video duration (original video / speed)
+            video_dur = video['duration']
+            if speed != 1.0 and speed > 0:
+                video_dur = video_dur / speed
+            cmd.extend(['-t', str(video_dur)])
             if audio_filters and video['has_audio']:
                 cmd.extend(['-af', ','.join(audio_filters)])
         
