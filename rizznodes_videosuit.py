@@ -257,13 +257,31 @@ class RizzExtractFrames:
     def extract_frames(self, video):
         video_path = video['path']
         duration = video['duration']
+        frame_count = video.get('frame_count', 0)
+        fps = video.get('fps', 24.0)
         
         # Extract first frame (at 0 seconds)
         first_frame = extract_frame_at_time(video_path, 0.0)
         
-        # Extract last frame (slightly before the end to avoid EOF issues)
-        last_time = max(0, duration - 0.1)
+        # Extract last frame
+        # Better strategy: calculate timestamp of the last frame using frame count
+        if frame_count > 1 and fps > 0:
+            # Time of the start of the last frame
+            last_time = (frame_count - 1) / fps
+        else:
+            # Fallback: seek to a bit before end
+            # Using 0.5s buffer is safer than 0.1s to ensure we hit a frame
+            last_time = max(0, duration - 0.1)
+            
         last_frame = extract_frame_at_time(video_path, last_time)
+        
+        # If last frame failed (black frame check), try seeking back a bit more
+        is_black = torch.all(last_frame == 0)
+        if is_black and duration > 1.0:
+            print("[RizzNodes] Last frame extraction failed, retrying earlier...")
+            # Try 1 second before end
+            retry_time = max(0, duration - 1.0)
+            last_frame = extract_frame_at_time(video_path, retry_time)
         
         return (video, first_frame, last_frame)
 
@@ -297,6 +315,10 @@ class RizzVideoEffects:
                 # Speed/reverse
                 "speed": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1,
                     "tooltip": "Playback speed. 0.5 = slow motion, 2.0 = double speed."}),
+                "interpolation_mode": (["None", "Frame Blend", "Optical Flow"], {
+                    "default": "None",
+                    "tooltip": "Interpolation method for slow motion (speed < 1.0). 'Frame Blend' is faster, 'Optical Flow' is very slow but smoother."
+                }),
                 "reverse": ("BOOLEAN", {"default": False, "tooltip": "Reverse video playback."}),
                 # Fade
                 "fade_in": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.1,
@@ -361,7 +383,7 @@ class RizzVideoEffects:
     def apply_effects(self, video, audio_count=1, image_count=0,
                       speed=1.0, reverse=False, fade_in=0.0, fade_out=0.0,
                       brightness=0.0, contrast=1.0, saturation=1.0,
-                      end_with_audio=True, **kwargs):
+                      end_with_audio=True, interpolation_mode="None", **kwargs):
         """Apply video effects with dynamic audio/image inputs from kwargs."""
         
         input_path = video['path']
@@ -375,6 +397,20 @@ class RizzVideoEffects:
         
         # Speed adjustment
         if speed != 1.0:
+            # Interpolation logic (only useful when slowing down, i.e., speed < 1.0)
+            if interpolation_mode != "None":
+                # Calculate target FPS to maintain smoothness at the new duration
+                # If speed is 0.5 (2x slow mo), we want double the frames
+                input_fps = video.get('fps', 24.0)
+                target_fps = input_fps / speed
+                
+                if interpolation_mode == "Frame Blend":
+                    filters.append(f"minterpolate='mi_mode=blend:fps={target_fps}'")
+                elif interpolation_mode == "Optical Flow":
+                    # mci: motion compensated interpolation
+                    # mc_mode=aobmc: adaptive overlapping block motion compensation (higher quality)
+                    filters.append(f"minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps={target_fps}'")
+            
             filters.append(f"setpts={1/speed}*PTS")
             audio_filters.append(f"atempo={speed}")
         
@@ -735,7 +771,7 @@ class RizzSaveVideo:
         return {
             "required": {
                 "video": ("VIDEO",),
-                "filename_prefix": ("STRING", {"default": "RizzVideo", "tooltip": "Prefix for the output filename. Counter will be appended automatically."}),
+                "filename_prefix": ("STRING", {"default": "RizzVideo/Vid", "tooltip": "Prefix for the output filename. Counter will be appended automatically."}),
                 "fps": ("INT", {"default": 24, "min": 1, "max": 120, "tooltip": "Frames per second for the output video. Ignored if use_source_fps is True."}),
             },
             "optional": {
@@ -743,7 +779,7 @@ class RizzSaveVideo:
                 "quality_crf": ("INT", {"default": 23, "min": 0, "max": 51, "tooltip": "Constant Rate Factor: 0 = lossless, 23 = default, 51 = worst quality. Lower = better quality, larger file."}),
                 "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"], {"default": "medium", "tooltip": "Encoding speed preset. Slower = better compression but longer encoding time."}),
                 "pixel_format": (["yuv420p", "yuv444p"], {"default": "yuv420p", "tooltip": "yuv420p is widely compatible. yuv444p preserves more color detail but less compatible."}),
-                "audio_codec": (["aac", "mp3", "opus"], {"default": "aac", "tooltip": "Audio codec. AAC is most compatible with MP4. Opus has best quality at low bitrates."}),
+                "audio_codec": (["aac", "mp3"], {"default": "aac", "tooltip": "Audio codec. AAC is most compatible with MP4."}),
                 "audio_bitrate": (["64k", "96k", "128k", "192k", "256k", "320k"], {"default": "192k", "tooltip": "Audio bitrate. Higher = better quality. 192k is good quality, 320k is near-lossless."}),
                 "use_source_fps": ("BOOLEAN", {"default": True, "tooltip": "If True, uses the original video's FPS. If False, uses the fps setting above."}),
             },
@@ -916,6 +952,199 @@ class RizzPreviewVideo:
         }
 
 
+        return (output_path, output_video)
+
+
+# ============================================================================
+# Node 6: RizzSeparateVideoAudio
+# ============================================================================
+
+class RizzSeparateVideoAudio:
+    """Separates video and audio tracks from a VIDEO input."""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+            }
+        }
+    
+    RETURN_TYPES = ("VIDEO", "AUDIO")
+    RETURN_NAMES = ("video", "audio")
+    FUNCTION = "separate"
+    CATEGORY = "RizzNodes/Video"
+    
+    def separate(self, video):
+        # Extract audio and also create a muted video file
+        
+        # Check if video has audio
+        if not video.get('has_audio', False):
+             # Return as-is
+             empty_audio = {"waveform": torch.zeros((1, 1), dtype=torch.float32), "sample_rate": 48000}
+             return (video, empty_audio)
+             
+        input_path = video['path']
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Paths
+        audio_path = os.path.join(temp_dir, f"extracted_audio_{uuid.uuid4().hex}.wav")
+        muted_video_path = os.path.join(temp_dir, f"muted_video_{uuid.uuid4().hex}.mp4")
+        
+        try:
+            # 1. Extract Audio
+            cmd_audio = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
+                audio_path
+            ]
+            subprocess.run(cmd_audio, check=True, capture_output=True)
+            
+            # Read wav for AUDIO output
+            import soundfile as sf
+            waveform, sample_rate = sf.read(audio_path)
+            waveform = torch.from_numpy(waveform).float()
+            
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(1) # [T, 1]
+            
+            # Transpose to [C, T] -> Unsqueeze batch -> [1, C, T]
+            waveform = waveform.t().unsqueeze(0) 
+            audio_output = {"waveform": waveform, "sample_rate": sample_rate}
+            
+            # Clean up audio file
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+
+            # 2. Create Muted Video (Copy video stream, remove audio)
+            cmd_video = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-c:v', 'copy', '-an',
+                muted_video_path
+            ]
+            subprocess.run(cmd_video, check=True, capture_output=True)
+            
+            # Get info for new video
+            muted_video_info = get_video_info(muted_video_path)
+            # Ensure metadata says no audio
+            muted_video_info['has_audio'] = False
+                
+            return (muted_video_info, audio_output)
+            
+        except subprocess.CalledProcessError as e:
+            print(f"[RizzNodes VideoSuit] FFmpeg error during separation: {e}")
+            if e.stderr:
+                print(f"Stderr: {e.stderr.decode('utf-8')}")
+            empty_audio = {"waveform": torch.zeros((1, 1, 1), dtype=torch.float32), "sample_rate": 44100}
+            return (video, empty_audio)
+        except Exception as e:
+            print(f"[RizzNodes VideoSuit] Error during separation: {e}")
+            empty_audio = {"waveform": torch.zeros((1, 1, 1), dtype=torch.float32), "sample_rate": 44100}
+            return (video, empty_audio)
+
+
+# ============================================================================
+# Node 7: RizzExtractAllFrames
+# ============================================================================
+
+class RizzExtractAllFrames:
+    """Extract all frames from a video as a batch of images.
+    WARNING: Can consume huge amounts of RAM!"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "limit_frames": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Limit number of frames to extract. 0 = unlimited."}),
+            },
+            "optional": {
+                "start_time": ("FLOAT", {"default": 0.0, "min": 0.0, "tooltip": "Start extraction at this time (seconds)."}),
+                "end_time": ("FLOAT", {"default": 0.0, "min": 0.0, "tooltip": "End extraction at this time (seconds). 0 = end of video."}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "extract_all"
+    CATEGORY = "RizzNodes/Video"
+    
+    def extract_all(self, video, limit_frames=0, start_time=0.0, end_time=0.0):
+        video_path = video['path']
+        import cv2
+        
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+             raise ValueError(f"Could not open video: {video_path}")
+        
+        fps = video.get('fps', 24.0)
+        total_frames_in_file = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        start_frame = int(start_time * fps)
+        
+        if end_time > 0:
+            end_frame = min(int(end_time * fps), total_frames_in_file)
+        else:
+            end_frame = total_frames_in_file
+            
+        # Ensure range is valid
+        if start_frame >= end_frame:
+             return (torch.zeros((1, 64, 64, 3), dtype=torch.float32),)
+             
+        max_frames_to_read = end_frame - start_frame
+        
+        # Apply strict limit if set
+        if limit_frames > 0:
+            max_frames_to_read = min(max_frames_to_read, limit_frames)
+            
+        # Pre-allocate output tensor: [B, H, W, C]
+        # Note: BGR -> RGB will be done during assignment
+        print(f"[RizzNodes] Pre-allocating {max_frames_to_read} frames ({width}x{height})...")
+        try:
+            batch = torch.empty((max_frames_to_read, height, width, 3), dtype=torch.float32)
+        except RuntimeError:
+            raise RuntimeError(f"Not enough RAM to allocate {max_frames_to_read} frames! Try reducing limit_frames.")
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        frames_read = 0
+        
+        print(f"[RizzNodes] Extracting frames {start_frame} to {start_frame + max_frames_to_read}...")
+        
+        for i in range(max_frames_to_read):
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Convert BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Normalize to 0-1 and assign directly to pre-allocated tensor
+            batch[i] = torch.from_numpy(frame.astype(np.float32) / 255.0)
+            frames_read += 1
+            
+        cap.release()
+        
+        # If we read fewer frames than expected (e.g. EOF), slice the tensor
+        if frames_read < max_frames_to_read:
+            print(f"[RizzNodes] Read {frames_read} frames (expected {max_frames_to_read}). trimming...")
+            batch = batch[:frames_read]
+            
+        if frames_read == 0:
+             return (torch.zeros((1, 64, 64, 3), dtype=torch.float32),)
+
+        print(f"[RizzNodes] Output batch shape: {batch.shape}")
+        
+        import gc
+        gc.collect()
+        
+        return (batch,)
+
+
 # ============================================================================
 # Node Mappings
 # ============================================================================
@@ -926,13 +1155,17 @@ NODE_CLASS_MAPPINGS = {
     "RizzVideoEffects": RizzVideoEffects,
     "RizzSaveVideo": RizzSaveVideo,
     "RizzPreviewVideo": RizzPreviewVideo,
+    "RizzSeparateVideoAudio": RizzSeparateVideoAudio,
+    "RizzExtractAllFrames": RizzExtractAllFrames,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RizzLoadVideo": "Rizz Load Video",
-    "RizzExtractFrames": "Rizz Extract First/Last Frames",
-    "RizzVideoEffects": "Rizz Video Effects",
-    "RizzSaveVideo": "Rizz Save Video",
-    "RizzPreviewVideo": "Rizz Preview Video",
+    "RizzLoadVideo": "🎥 Load Video (Rizz)",
+    "RizzExtractFrames": "🎞️ Extract Frames (Start/End)",
+    "RizzVideoEffects": "🎬 Video Effects (Rizz)",
+    "RizzSaveVideo": "💾 Save Video (Rizz)",
+    "RizzPreviewVideo": "📺 Preview Video (Rizz)",
+    "RizzSeparateVideoAudio": "🔊 Separate Video/Audio",
+    "RizzExtractAllFrames": "🎞️ Extract ALL Frames (Batch)",
 }
 

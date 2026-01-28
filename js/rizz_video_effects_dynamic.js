@@ -61,7 +61,7 @@ app.registerExtension({
             hideCountWidgets();
 
             // Cache fixed widgets
-            const fixedNames = ["speed", "reverse", "fade_in", "fade_out", "brightness", "contrast", "saturation", "end_with_audio"];
+            const fixedNames = ["speed", "interpolation_mode", "reverse", "fade_in", "fade_out", "brightness", "contrast", "saturation", "end_with_audio"];
             for (const name of fixedNames) {
                 const w = allWidgets.find(w => w.name === name);
                 if (w) node.cachedWidgets.fixed.push(w);
