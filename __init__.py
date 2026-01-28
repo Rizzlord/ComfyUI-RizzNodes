@@ -1,8 +1,12 @@
 from .rizznodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .rizznodes_gds import RizzGDSPatcher
+from .rizznodes_meshops import QuadremeshNode
 
 NODE_CLASS_MAPPINGS["RizzGDSPatcher"] = RizzGDSPatcher
 NODE_DISPLAY_NAME_MAPPINGS["RizzGDSPatcher"] = "GDS Patcher (Rizz)"
+
+NODE_CLASS_MAPPINGS["Quadremesh"] = QuadremeshNode
+NODE_DISPLAY_NAME_MAPPINGS["Quadremesh"] = "Quadremesh (Adaptive)"
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
 
