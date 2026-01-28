@@ -1151,10 +1151,22 @@ class RizzExtractAllFrames:
 
 MAX_VIDEO_SLOTS = 25
 
+TRANSITION_MODES = [
+    "None", "fade", "wipeleft", "wiperight", "wipeup", "wipedown", 
+    "slideleft", "slideright", "slideup", "slidedown", "circlecrop", 
+    "rectcrop", "distance", "fadeblack", "fadewhite", "radial", 
+    "smoothleft", "smoothright", "smoothup", "smoothdown", 
+    "circleopen", "circleclose", "vertopen", "vertclose", 
+    "horzopen", "horzclose", "dissolve", "pixelize", "diagtl", 
+    "diagtr", "diagbl", "diagbr", "hlslice", "hrslice", 
+    "vuslice", "vdslice", "hblur", "fadegrayscale", 
+    "wipetl", "wipetr", "wipebl", "wipebr", "squeezeh", "squeezev"
+]
+
 class RizzEditClips:
-    """Combine and trim video clips.
+    """Combine and trim video clips with transitions.
     - If 1 clip: trim start/end.
-    - If multiple: trim start of first, end of last, concatenate all.
+    - If multiple: trim start/end, then combine with optional transitions.
     """
     
     @classmethod
@@ -1171,7 +1183,7 @@ class RizzEditClips:
                 }),
                 "trim_end": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1,
-                    "tooltip": "Seconds to trim from the END of the LAST clip (0 = no trim from end)."
+                    "tooltip": "Seconds to trim from the END of the LAST clip."
                 }),
             },
             "optional": {}
@@ -1180,6 +1192,13 @@ class RizzEditClips:
         # Dynamic inputs
         for i in range(1, MAX_VIDEO_SLOTS + 1):
              inputs["optional"][f"video_{i}"] = ("VIDEO",)
+             if i > 1:
+                 # Transition FROM previous clip TO this clip
+                 inputs["optional"][f"transition_{i}"] = (TRANSITION_MODES, {"default": "None"})
+                 inputs["optional"][f"trans_len_{i}"] = ("FLOAT", {
+                     "default": 0.5, "min": 0.1, "max": 5.0, "step": 0.1,
+                     "tooltip": "Duration of transition in seconds."
+                 })
              
         return inputs
     
@@ -1198,47 +1217,54 @@ class RizzEditClips:
         for i in range(1, video_count + 1):
             vid = kwargs.get(f"video_{i}")
             if vid:
-                video_inputs.append(vid)
+                video_inputs.append({
+                    'video': vid,
+                    'index': i,
+                    'transition': kwargs.get(f"transition_{i}", "None"),
+                    'trans_len': kwargs.get(f"trans_len_{i}", 1.0)
+                })
                 
         if not video_inputs:
             raise ValueError("No video inputs provided.")
             
         # Determine common properties (use first video as reference)
-        ref_video = video_inputs[0]
-        # We might need to scale everything to ref dimensions? 
-        # For simplicity, we assume user provides matching resolutions or we let ffmpeg handle/scale.
-        # But `concat` filter usually requires matching resolution/fps.
-        # To be safe, we will normalize all clips to the resolution of the first clip using scale filter.
+        ref_video = video_inputs[0]['video']
         width = ref_video['width']
         height = ref_video['height']
         fps = ref_video.get('fps', 24.0)
-        has_audio = any(v.get('has_audio', False) for v in video_inputs)
+        
+        # Check global audio presence
+        has_audio = any(v['video'].get('has_audio', False) for v in video_inputs)
         
         cmd = ['ffmpeg', '-y']
         
         # Add inputs
         for v in video_inputs:
-            cmd.extend(['-i', v['path']])
+            cmd.extend(['-i', v['video']['path']])
             
         filter_complex = []
         
-        concat_v_parts = []
-        concat_a_parts = []
+        # We need to process each segment first (trim/scale)
+        # Then we chain them:
+        # v0 + v1 -> m1 (xfade)
+        # m1 + v2 -> m2 (xfade)
+        # ...
         
-        for idx, vid in enumerate(video_inputs):
-            # Input labels
+        # Segment preparation
+        seg_v_labels = []
+        seg_a_labels = []
+        seg_durations = []
+        
+        for idx, item in enumerate(video_inputs):
+            vid = item['video']
             in_v = f"{idx}:v"
             in_a = f"{idx}:a"
             
-            out_v = f"v{idx}"
-            out_a = f"a{idx}"
+            out_v = f"segv{idx}"
+            out_a = f"sega{idx}"
             
-            # Prepare trim logic
-            # Start trim applies only to idx == 0
-            # End trim applies only to idx == last
-            
+            # Trim logic
             start_cut = 0.0
-            end_cut = 0.0 # 0 means "duration - trim_end"
             
             duration = vid['duration']
             
@@ -1246,45 +1272,38 @@ class RizzEditClips:
                 start_cut = trim_start
                 
             if idx == len(video_inputs) - 1:
-                # Calculate end time: duration - trim_end
-                # Ensure we don't trim past start
-                target_duration = duration - (start_cut if idx == 0 else 0) - trim_end
-                if target_duration < 0.1:
-                    target_duration = 0.1 # Minimum duration safety
-                    print(f"[RizzNodes] Warning: trim settings would result in empty clip {idx+1}. Clamping to 0.1s.")
-                    
-                # For trim filter, "end" is the timestamp
-                # If idx==0 and idx==last (single clip), end time is duration - trim_end
-                # But start_cut is absolute time.
-                
-                # logic:
-                # trim=start=START:duration=DURATION
-                # or trim=start=START:end=END
-                
-                # To be simpler:
-                # Start trim: trim=start=trim_start
-                # End trim: trim=end=(duration - trim_end)
-                
+                # Calculate end timestamp
                 end_time_abs = duration - trim_end
                 if end_time_abs <= start_cut:
                     end_time_abs = start_cut + 0.1
-                
-                # If trim_end is 0, we don't need 'end=' usually, but explicit is fine.
                 target_end = end_time_abs
             else:
                 target_end = duration
-            
-            # Build filter chain for this segment
-            # 1. Scale to match reference width/height (force)
-            # 2. Trim
-            # 3. SETPTS
-            
+                
+            # Filter Chain for Segment
             filters_chain = []
             
-            # Scale
+            # 1. Scale and Normalize FPS/Timebase
+            # xfade requires matching height/width AND timebase/framerate
+            # We enforce standard TB and the FPS of the first clip
             filters_chain.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
             
-            # Trim
+            # FPS Handling:
+            # If src_fps < target_fps: Interpolate (Frame Blend)
+            # If src_fps > target_fps: Downscale (Drop frames)
+            src_fps = vid.get('fps', fps)
+            if src_fps < fps:
+                print(f"[RizzNodes] Interpolating clip {idx+1} from {src_fps}fps to {fps}fps (Frame Blend)")
+                filters_chain.append(f"minterpolate='mi_mode=blend:fps={fps}'")
+            elif src_fps > fps:
+                print(f"[RizzNodes] Downscaling clip {idx+1} from {src_fps}fps to {fps}fps")
+                filters_chain.append(f"fps={fps}")
+            else:
+                 filters_chain.append(f"fps={fps}")
+                
+            filters_chain.append("format=yuv420p") # xfade also likes matching pixel formats
+            
+            # 2. Trim
             trim_args = []
             if start_cut > 0:
                 trim_args.append(f"start={start_cut}")
@@ -1294,21 +1313,22 @@ class RizzEditClips:
             if trim_args:
                 filters_chain.append(f"trim={':'.join(trim_args)}")
             
-            # Reset PTS is crucial after trim
+            # 3. SETPTS (Must be settb=AVTB to match for xfade?) 
+            # Actually settb=AVTB helps, but fps filter usually sets tb to 1/fps
+            # Let's add settb=AVTB just to be safe if fps doesn't
+            filters_chain.append("settb=AVTB")
             filters_chain.append("setpts=PTS-STARTPTS")
             
-            # Construct the filter string
-            filter_str = ",".join(filters_chain)
-            filter_complex.append(f"[{in_v}]{filter_str}[{out_v}]")
-            concat_v_parts.append(f"[{out_v}]")
+            filter_complex.append(f"[{in_v}]{','.join(filters_chain)}[{out_v}]")
+            seg_v_labels.append(f"[{out_v}]")
             
-            # AUDIO Processing
-            # We must provide audio for every segment if we want the output to have audio
-            # If a clip is missing audio, we generate silence
+            # Calculate segment duration
+            actual_duration = target_end - start_cut
+            seg_durations.append(actual_duration)
             
+            # 4. Audio
             if has_audio:
                 if vid.get('has_audio', False):
-                    # Trim audio matching video
                     atrim_args = []
                     if start_cut > 0:
                         atrim_args.append(f"start={start_cut}")
@@ -1321,47 +1341,97 @@ class RizzEditClips:
                     afilter.append("asetpts=PTS-STARTPTS")
                     
                     filter_complex.append(f"[{in_a}]{','.join(afilter)}[{out_a}]")
-                    concat_a_parts.append(f"[{out_a}]")
+                    seg_a_labels.append(f"[{out_a}]")
                 else:
-                    # Generate silence with same duration as TRIMMED video
-                    # We know the duration of the current trimmed segment is:
-                    # target_end - start_cut
-                    
-                    seg_duration = target_end - start_cut
-                    # Safety check for minimal duration
-                    if seg_duration < 0.1: seg_duration = 0.1
-                    
                     # Generate silence
-                    # anullsrc -> atrim -> asetpts
+                    if actual_duration < 0.1: actual_duration = 0.1
                     silence_label = f"silence{idx}"
-                    filter_complex.append(f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration={seg_duration}[{silence_label}]")
-                    concat_a_parts.append(f"[{silence_label}]")
+                    filter_complex.append(f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration={actual_duration}[{silence_label}]")
+                    seg_a_labels.append(f"[{silence_label}]")
+
+        # Now, chain them together
+        # We start with seg 0
+        current_v = seg_v_labels[0]
+        current_a = seg_a_labels[0] if has_audio else None
         
-        # Determine if we can do audio concat
-        # Now we forced audio for all parts if has_audio is true
-        do_audio = has_audio and len(concat_a_parts) == len(video_inputs)
+        accumulated_duration = seg_durations[0]
         
-        # Concat filter
-        # Interleave inputs: [v0][a0][v1][a1]... for concat filter
-        concat_inputs = []
-        for i in range(len(video_inputs)):
-            concat_inputs.append(concat_v_parts[i])
-            if do_audio:
-                concat_inputs.append(concat_a_parts[i])
-                
-        filter_complex.append(f"{''.join(concat_inputs)}concat=n={len(video_inputs)}:v=1:a={1 if do_audio else 0}[vout]{'[aout]' if do_audio else ''}")
-        
-        cmd.extend(['-filter_complex', ";".join(filter_complex)])
-        cmd.extend(['-map', '[vout]'])
-        if do_audio:
-            cmd.extend(['-map', '[aout]'])
+        for i in range(1, len(video_inputs)):
+            next_v = seg_v_labels[i]
+            next_a = seg_a_labels[i] if has_audio else None
+            next_dur = seg_durations[i]
             
+            item = video_inputs[i]
+            trans_mode = item['transition']
+            trans_len = item['trans_len']
+            
+            # Validate max transition length vs accumulated duration and next clip duration
+            # Offset = accumulated_duration - trans_len
+            # We need accumulated_duration > trans_len AND next_dur > trans_len
+            # If not, fallback to simple concat (offset = accumulated_duration, len=0)
+            
+            if trans_mode != "None" and trans_len > 0 and accumulated_duration > trans_len and next_dur > trans_len:
+                # XFADE
+                offset = accumulated_duration - trans_len
+                out_mix_v = f"mixv{i}"
+                
+                filter_complex.append(f"{current_v}{next_v}xfade=transition={trans_mode}:duration={trans_len}:offset={offset}[{out_mix_v}]")
+                current_v = f"[{out_mix_v}]"
+                
+                # ACROSSFADE for Audio
+                if has_audio:
+                    out_mix_a = f"mixa{i}"
+                    # Audio crossfade doesn't use offset syntax exactly same as xfade usually?
+                    # actually 'acrossfade' filter: "d=DURATION:c1=curve1:c2=curve2"
+                    # It automatically overlaps by duration. It consumes streams.
+                    # Wait, xfade uses absolute offset. acrossfade overlaps the end of 1st with start of 2nd.
+                    # xfade offset logic basically assumes streams are playing from 0?
+                    # When we use complex filter chains, intermediate streams start at 0?
+                    # YES.
+                    # IMPORTANT: xfade takes two streams.
+                    # Offset is relative to the start of the first stream.
+                    
+                    # acrossfade usage: params 'd' (duration), 'o' (overlap - bool?), 'c1', 'c2'. Usually just d=...
+                    # But acrossfade does NOT take an offset. It just overlaps end of A and start of B.
+                    # This matches xfade logic nicely properly if we just want them to overlap.
+                    # However, does xfade change the PTS?
+                    # xfade output duration = durA + durB - trans_len
+                    # acrossfade output duration = durA + durB - trans_len
+                    
+                    filter_complex.append(f"{current_a}{next_a}acrossfade=d={trans_len}[{out_mix_a}]")
+                    current_a = f"[{out_mix_a}]"
+                
+                # Update accumulated duration
+                accumulated_duration = accumulated_duration + next_dur - trans_len
+                
+            else:
+                # CONCAT (No transition)
+                # If we mix xfade and concat, we must use concat filter for [current] + [next].
+                # concat filter takes n=2
+                
+                out_concat_v = f"concatv{i}"
+                filter_complex.append(f"{current_v}{next_v}concat=n=2:v=1:a=0[{out_concat_v}]")
+                current_v = f"[{out_concat_v}]"
+                
+                if has_audio:
+                    out_concat_a = f"concata{i}"
+                    filter_complex.append(f"{current_a}{next_a}concat=n=2:v=0:a=1[{out_concat_a}]")
+                    current_a = f"[{out_concat_a}]"
+                    
+                accumulated_duration += next_dur
+
+        # Final mapping
+        cmd.extend(['-filter_complex', ";".join(filter_complex)])
+        cmd.extend(['-map', current_v])
+        if has_audio and current_a:
+             cmd.extend(['-map', current_a])
+             
         # Encoding output
         cmd.extend([
             '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
             '-pix_fmt', 'yuv420p',
         ])
-        if do_audio:
+        if has_audio:
             cmd.extend(['-c:a', 'aac', '-b:a', '192k'])
             
         cmd.append(output_path)
@@ -1371,13 +1441,12 @@ class RizzEditClips:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if result.returncode != 0:
                 print(f"[RizzNodes] EditClips FFmpeg error: {result.stderr}")
-                # Fallback? No, complex filter failure is hard to fallback from.
                 raise RuntimeError(f"FFmpeg Error: {result.stderr[:500]}")
                 
             return (get_video_info(output_path),)
             
         except Exception as e:
-            print(f"[RizzNodes] Error in EditClips: {e}")
+            print(f"[RizzNodes] Error in EditClips (Transition): {e}")
             raise e
 
 

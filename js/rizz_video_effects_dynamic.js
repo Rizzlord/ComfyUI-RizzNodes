@@ -21,7 +21,8 @@ function setupEditClips(node) {
     if (node.properties["visibleVideoCount"] === undefined) node.properties["visibleVideoCount"] = 1;
 
     node.cachedWidgets = {
-        fixed: []
+        fixed: [],
+        transitions: {}
     };
 
     // Cache for input slots
@@ -59,12 +60,21 @@ function setupEditClips(node) {
             if (w) node.cachedWidgets.fixed.push(w);
         }
 
-        // Cache dynamic video inputs
+        // Cache dynamic video inputs and transition widgets
         // RizzEditClips defines video_1 ... video_25
+        // Transitions start at 2
         for (let i = 1; i <= 25; i++) {
             const vidInput = allInputs.find(inp => inp.name === `video_${i}`);
             if (vidInput) {
                 node.cachedInputs.video[i] = vidInput;
+            }
+
+            if (i > 1) {
+                const wTrans = allWidgets.find(w => w.name === `transition_${i}`);
+                const wLen = allWidgets.find(w => w.name === `trans_len_${i}`);
+                if (wTrans && wLen) {
+                    node.cachedWidgets.transitions[i] = { trans: wTrans, len: wLen };
+                }
             }
         }
 
@@ -108,9 +118,18 @@ function setupEditClips(node) {
             this.widgets.push(node.cachedVideoCount);
         }
 
-        // Add fixed widgets
+        // Add fixed widgets (trims)
         for (const w of this.cachedWidgets.fixed) {
             this.widgets.push(w);
+        }
+
+        // Add Transition Widgets for clips > 1
+        for (let i = 2; i <= videoCount; i++) {
+            const t = this.cachedWidgets.transitions[i];
+            if (t) {
+                this.widgets.push(t.trans);
+                this.widgets.push(t.len);
+            }
         }
 
         // === Update Input Connections ===
@@ -129,7 +148,10 @@ function setupEditClips(node) {
         const PADDING = 20;
 
         const inputCount = videoCount;
-        const widgetCount = 1 + this.cachedWidgets.fixed.length; // control + fixed
+        // Count + Fixed(2) + Transitions((videoCount-1)*2)
+        // If count=1, transitions=0.
+        const transitionWidgetCount = (videoCount > 1) ? (videoCount - 1) * 2 : 0;
+        const widgetCount = 1 + this.cachedWidgets.fixed.length + transitionWidgetCount;
 
         const targetH = HEADER_H + (inputCount * INPUT_H) + (widgetCount * WIDGET_H) + PADDING;
         this.setSize([this.size[0], Math.max(150, targetH)]);
