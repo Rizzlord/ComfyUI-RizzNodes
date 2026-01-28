@@ -1185,6 +1185,10 @@ class RizzEditClips:
                     "default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1,
                     "tooltip": "Seconds to trim from the END of the LAST clip."
                 }),
+                "process_clips": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable frame interpolation and advanced processing for smooth framerate conversion. (Slower)"
+                }),
             },
             "optional": {}
         }
@@ -1207,7 +1211,7 @@ class RizzEditClips:
     FUNCTION = "edit_clips"
     CATEGORY = "RizzNodes/Video"
     
-    def edit_clips(self, video_count, trim_start=0.0, trim_end=0.0, **kwargs):
+    def edit_clips(self, video_count, trim_start=0.0, trim_end=0.0, process_clips=False, **kwargs):
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
         output_path = os.path.join(temp_dir, f"rizz_edit_{uuid.uuid4().hex}.mp4")
@@ -1289,16 +1293,24 @@ class RizzEditClips:
             filters_chain.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
             
             # FPS Handling:
-            # If src_fps < target_fps: Interpolate (Frame Blend)
-            # If src_fps > target_fps: Downscale (Drop frames)
+            # If process_clips is True:
+            #   If src_fps < target_fps: Interpolate (Frame Blend)
+            #   If src_fps > target_fps: Downscale (Drop frames)
+            # Else (False):
+            #   Just force FPS (Drop/Dup frames) - fast and simple.
+            
             src_fps = vid.get('fps', fps)
-            if src_fps < fps:
-                print(f"[RizzNodes] Interpolating clip {idx+1} from {src_fps}fps to {fps}fps (Frame Blend)")
-                filters_chain.append(f"minterpolate='mi_mode=blend:fps={fps}'")
-            elif src_fps > fps:
-                print(f"[RizzNodes] Downscaling clip {idx+1} from {src_fps}fps to {fps}fps")
-                filters_chain.append(f"fps={fps}")
+            if process_clips:
+                if src_fps < fps:
+                    print(f"[RizzNodes] Interpolating clip {idx+1} from {src_fps}fps to {fps}fps (Frame Blend)")
+                    filters_chain.append(f"minterpolate='mi_mode=blend:fps={fps}'")
+                elif src_fps > fps:
+                    print(f"[RizzNodes] Downscaling clip {idx+1} from {src_fps}fps to {fps}fps")
+                    filters_chain.append(f"fps={fps}")
+                else:
+                    filters_chain.append(f"fps={fps}")
             else:
+                 # Default fast behavior: just force fps/timebase without blend
                  filters_chain.append(f"fps={fps}")
                 
             filters_chain.append("format=yuv420p") # xfade also likes matching pixel formats
