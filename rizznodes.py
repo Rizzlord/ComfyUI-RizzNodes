@@ -436,8 +436,10 @@ class RizzUpscaleImageBatch:
                 "images": ("IMAGE", ),
                 "upscale_model": ("UPSCALE_MODEL", ),
                 "fixed_resolution": ("BOOLEAN", {"default": False}),
-                "resolution": ([256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096],),
+                "width": ("INT", {"default": 512, "min": 0, "max": 8192}),
+                "height": ("INT", {"default": 512, "min": 0, "max": 8192}),
                 "scale_method": (["LANCZOS", "NEAREST"],),
+                "vram_cleanup": ("BOOLEAN", {"default": True, "label": "VRAM Cleanup (Slows down batch)"}),
             },
             "optional": {
                 "masks": ("MASK",),
@@ -450,7 +452,7 @@ class RizzUpscaleImageBatch:
     FUNCTION = "upscale_batch"
     CATEGORY = "RizzNodes/Image"
 
-    def upscale_batch(self, images, upscale_model, fixed_resolution, resolution, scale_method, masks=None, output_type="BATCH"):
+    def upscale_batch(self, images, upscale_model, fixed_resolution, width, height, scale_method, vram_cleanup=True, masks=None, output_type="BATCH"):
         def _normalize_mask_batch(mask_batch):
             if mask_batch.dim() == 4:
                 if mask_batch.shape[1] == 1:
@@ -592,7 +594,7 @@ class RizzUpscaleImageBatch:
                 upscaled_np = upscaled.permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()
                 upscaled_np = np.clip(upscaled_np, 0.0, 1.0)
                 upscaled_pil = Image.fromarray((upscaled_np * 255).astype(np.uint8))
-                target_resolution = (resolution, resolution)
+                target_resolution = (width, height)
                 resized_pil = upscaled_pil.resize(target_resolution, resampling_filter)
                 resized_np = np.array(resized_pil).astype(np.float32) / 255.0
                 upscaled = torch.from_numpy(resized_np).unsqueeze(0).permute(0, 3, 1, 2).to(image_tensor.device)
@@ -617,8 +619,9 @@ class RizzUpscaleImageBatch:
             upscaled_masks_list.append(mask_resized_cpu)
             del mask_resized
 
-            if (not descriptor_mode) and upscaled_device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if vram_cleanup:
+                if (not descriptor_mode) and upscaled_device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             pbar.update(1)
 
         if not upscaled_images_list:
@@ -664,7 +667,7 @@ class RizzUpscaleImageBatch:
         )
 
     @classmethod
-    def IS_CHANGED(s, images, upscale_model, fixed_resolution, resolution, scale_method, masks=None, output_type="BATCH"):
+    def IS_CHANGED(s, images, upscale_model, fixed_resolution, width, height, scale_method, vram_cleanup=True, masks=None, output_type="BATCH"):
         return float("NaN")
 
 class RizzBlur:
