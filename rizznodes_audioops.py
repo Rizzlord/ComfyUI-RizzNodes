@@ -248,13 +248,29 @@ class RizzAudioMixer:
                      if next_wav.dim() == 2:
                          next_wav = next_wav.unsqueeze(0)
                         
+                     # Simple logic: Repeat enough times to cover available space + 1 buffer
                      original_len = next_wav.shape[-1]
                      repeats = (available_space // original_len) + 2
                      
                      if repeats > 1:
                          next_wav = next_wav.repeat(1, 1, int(repeats))
                      
+                     # Cut to exact fit
                      next_wav = next_wav[..., :available_space]
+
+                     # Apply fade out (0.5s)
+                     FADE_DURATION = 0.5
+                     fade_samples = int(FADE_DURATION * current_sr)
+                     
+                     # Only fade if we have enough length, otherwise fade whole clip
+                     if next_wav.shape[-1] < fade_samples:
+                         fade_samples = next_wav.shape[-1]
+                     
+                     if fade_samples > 0:
+                         # Create fade curve (1.0 -> 0.0)
+                         fade_curve = torch.linspace(1.0, 0.0, fade_samples, device=next_wav.device)
+                         # Apply to last fade_samples
+                         next_wav[..., -fade_samples:] *= fade_curve
             
             # Apply volume
             next_wav = next_wav * next_vol
