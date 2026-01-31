@@ -16,6 +16,7 @@ class RizzAudioMixer:
                 "overall_trim_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1}),
                 # Audio 1 optional settings (Mode 1 is not needed as it's the base)
                 "volume_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "repeat_1": ("BOOLEAN", {"default": False, "label_on": "Repeat (Fill)", "label_off": "No Repeat"}),
                 "trim_start_1": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1}),
                 "trim_end_1": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1}),
             }
@@ -27,6 +28,7 @@ class RizzAudioMixer:
             inputs["optional"][f"mode_{i}"] = ("BOOLEAN", {"default": True, "label_on": "Mix (Overlap)", "label_off": "Append (Sequence)"})
             inputs["optional"][f"start_time_{i}"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1})
             inputs["optional"][f"volume_{i}"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1})
+            inputs["optional"][f"repeat_{i}"] = ("BOOLEAN", {"default": False, "label_on": "Repeat (Fill)", "label_off": "No Repeat"})
             inputs["optional"][f"trim_start_{i}"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1})
             inputs["optional"][f"trim_end_{i}"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.1})
 
@@ -38,8 +40,6 @@ class RizzAudioMixer:
     CATEGORY = "RizzNodes/Audio"
 
     def mix_audio(self, audio_count, audio_1, overall_trim_start=0.0, overall_trim_end=0.0, **kwargs):
-        # Initialize accumulator
-        
         # Helper to trim audio tensor [batch, channels, samples]
         def trim_tensor(audio_tensor, sample_rate, start_sec, end_sec):
             total_samples = audio_tensor.shape[-1]
@@ -55,13 +55,14 @@ class RizzAudioMixer:
             
             return audio_tensor[..., start_sample:end_sample]
 
-        # Process audio_1 (Always present)
+        # 1. Collect all inputs
         audio_inputs = []
         
-        # Audio 1 Processing
+        # Audio 1 Processing (Always present)
         vol_1 = kwargs.get("volume_1", 1.0)
         trim_start_1 = kwargs.get("trim_start_1", 0.0)
         trim_end_1 = kwargs.get("trim_end_1", 0.0)
+        repeat_1 = kwargs.get("repeat_1", False)
         
         wf_1 = audio_1["waveform"]
         sr_1 = audio_1["sample_rate"]
@@ -74,7 +75,8 @@ class RizzAudioMixer:
             "data": audio_data_1,
             "mode": True, # Base is always mixed/base
             "volume": vol_1,
-            "start_time": 0.0 # Audio 1 always starts at 0
+            "start_time": 0.0,
+            "repeat": repeat_1
         })
 
         # Process remaining inputs
@@ -86,6 +88,7 @@ class RizzAudioMixer:
                 trim_start = kwargs.get(f"trim_start_{i}", 0.0)
                 trim_end = kwargs.get(f"trim_end_{i}", 0.0)
                 start_time = kwargs.get(f"start_time_{i}", 0.0)
+                repeat = kwargs.get(f"repeat_{i}", False)
                 
                 # Apply individual trim immediately
                 waveform = audio_data["waveform"]
@@ -93,75 +96,124 @@ class RizzAudioMixer:
                 if trim_start > 0 or trim_end > 0:
                      waveform = trim_tensor(waveform, sr, trim_start, trim_end)
                 
-                # Update audio_data with trimmed waveform
                 audio_data = {**audio_data, "waveform": waveform}
                 
                 audio_inputs.append({
                     "data": audio_data,
                     "mode": mode, # True=Mix, False=Append
                     "volume": volume,
-                    "start_time": start_time
+                    "start_time": start_time,
+                    "repeat": repeat
                 })
         
         if not audio_inputs:
              return ({"waveform": torch.zeros((1, 2, 44100)), "sample_rate": 44100}, 0.0)
 
-        # Base properties from first audio
-        base_audio = audio_inputs[0]["data"]
+        # 2. Pre-calculate Duration
+        # Calculate the expected valid duration of the composition based on NO-REPEAT tracks.
+        # Repeating tracks will be expanded to fill this duration.
         
-        # Helper to normalize waveform to [batch, channels, samples]
-        def get_waveform_tensor(audio_dict):
-            wf = audio_dict["waveform"]
-            # Handle standard ComfyUI format: [batch, channels, len] or [batch, len, channels] ?
-            # Most nodes output [batch, channels, length].
-            # rizznodes_videosuit handles:
-            # if waveform.ndim == 3: waveform = waveform[0] (Remove batch)
-            # if waveform.ndim == 2 and waveform.shape[0] < waveform.shape[1]: waveform = waveform.T
-            
-            # We want to work with [channels, length] for mixing single batch items, 
-            # OR [batch, channels, length] if we want to be correct.
-            # Let's standardise to [batch, channels, length].
-            
-            if wf.dim() == 2:
-                # Assuming [channels, length] or [length, samples]?
-                # Usually [channels, length] coming from torchaudio.load
-                pass 
-                
-            return wf.clone() 
-
+        base_audio = audio_inputs[0]["data"]
         target_sr = base_audio["sample_rate"]
         
-        # Start with the first audio
-        # We process the list sequentially
+        # Simulation loop
+        current_sim_len = 0 # In target_sr samples
         
-        # Accumulator:
-        current_waveform = audio_inputs[0]["data"]["waveform"].clone()
-        if audio_inputs[0]["volume"] != 1.0:
-            current_waveform *= audio_inputs[0]["volume"]
+        # Audio 1 Base Duration
+        # If Audio 1 is NOT repeating, it provides the baseline length.
+        if not audio_inputs[0]["repeat"]:
+            wf = audio_inputs[0]["data"]["waveform"]
+            l = wf.shape[-1]
+            # No resampling needed for base
+            current_sim_len = l
             
-        current_sr = audio_inputs[0]["data"]["sample_rate"]
+        for i in range(1, len(audio_inputs)):
+            inp = audio_inputs[i]
+            is_append = not inp["mode"]
+            is_repeat = inp["repeat"]
+            
+            # Skip duration calculation for repeating tracks (they adapt)
+            # Exception: If input is Append mode, Repeat is ignored anyway (can't loop infinite at end)
+            # So if Append, we treat as non-repeating for length calc.
+            if is_repeat and not is_append:
+                continue
+                
+            original_wf = inp["data"]["waveform"]
+            src_sr = inp["data"]["sample_rate"]
+            src_len = original_wf.shape[-1]
+            
+            # Normalize length to target_sr
+            if src_sr != target_sr:
+                scale = target_sr / src_sr
+                len_in_target = int(src_len * scale)
+            else:
+                len_in_target = src_len
+            
+            if is_append:
+                current_sim_len += len_in_target
+            else:
+                # Mix Mode
+                start_samp = int(inp["start_time"] * target_sr)
+                end_samp = start_samp + len_in_target
+                current_sim_len = max(current_sim_len, end_samp)
+        
+        # Fallback: If all tracks are repeating (current_sim_len == 0 but we have inputs),
+        # use the length of the first audio (original single cycle) to avoid silence/crash.
+        if current_sim_len == 0 and audio_inputs:
+             wf = audio_inputs[0]["data"]["waveform"]
+             # If base was resampled? No, base is target.
+             current_sim_len = wf.shape[-1]
 
+        final_duration_samples = current_sim_len
+        if final_duration_samples == 0:
+            # Absolute fallback
+            final_duration_samples = 1 # Avoid shape 0 errors
+        
+        # 3. Mixing Loop
+        
+        # Initialize accumulator with Audio 1
+        # If Audio 1 is repeating, we must tile it to final_duration_samples.
+        
+        curr_wf_1 = audio_inputs[0]["data"]["waveform"].clone()
+        if audio_inputs[0]["volume"] != 1.0:
+            curr_wf_1 *= audio_inputs[0]["volume"]
+            
+        if audio_inputs[0]["repeat"]:
+            # Tile to final_duration
+            target_len = final_duration_samples
+            if curr_wf_1.shape[-1] < target_len:
+                repeats = (target_len // curr_wf_1.shape[-1]) + 2
+                if repeats > 1:
+                     # Handle 2D/3D shape for repeat
+                     if curr_wf_1.dim() == 2:
+                         curr_wf_1 = curr_wf_1.repeat(1, repeats)
+                     else:
+                         curr_wf_1 = curr_wf_1.repeat(1, 1, repeats)
+                curr_wf_1 = curr_wf_1[..., :target_len]
+            elif curr_wf_1.shape[-1] > target_len:
+                # Case where Repeat=True but target is shorter? Cut it.
+                curr_wf_1 = curr_wf_1[..., :target_len]
+                
+        # If Audio 1 is NOT repeating but is shorter than final_duration (due to other tracks),
+        # Pad it? Or just let it be short and 'add' others?
+        # Standard mix behavior: start with Audio 1.
+        # If we just use Audio 1 as-is, the 'padding' happens during addition of longer tracks.
+        current_waveform = curr_wf_1
+        current_sr = target_sr
+        
         for i in range(1, len(audio_inputs)):
             next_input = audio_inputs[i]
             next_original_waveform = next_input["data"]["waveform"]
             next_sr = next_input["data"]["sample_rate"]
             next_vol = next_input["volume"]
             is_append = not next_input["mode"]
+            should_repeat = next_input["repeat"]
             
-            # Check dimensions
-            # Ensure shape matches [batch, channels, length]
-            # If current is 1 channel and next is 2, or vice versa, we might need adjustments.
-            # For simplicity, if channel mismatch, maybe duplicate mono to stereo?
-            
-            # Resampling check and handling
+            # Resample
             if next_sr != current_sr:
-                # Calculate new length
-                # samples_target = samples_source * (target_sr / source_sr)
                 scale_factor = current_sr / next_sr
                 new_length = int(next_original_waveform.shape[-1] * scale_factor)
                 
-                # Use interpolate (needs 3D input [batch, channels, time])
-                # next_original_waveform is [batch, channels, time]
                 if next_original_waveform.dim() == 2:
                     next_original_waveform = next_original_waveform.unsqueeze(0)
                 
@@ -171,46 +223,72 @@ class RizzAudioMixer:
                     mode='linear', 
                     align_corners=False
                 )
-                # Next tensor is now at current_sr
             else:
                 next_wav = next_original_waveform.clone()
 
+            # Handle Repeat (Only in Mix mode)
+            if not is_append and should_repeat:
+                start_time_sec = next_input["start_time"]
+                start_offset = int(start_time_sec * current_sr)
+                
+                # Available space is defined by final_duration_samples
+                # But notice: if we have Append tracks later, final_duration might be longer than current Mix scope?
+                # Actually final_duration includes Appends.
+                # So if we repeat, we fill the ENTIRE planned duration.
+                
+                # Wait, if I have Mix(Repeat) then Append. 
+                # Does Mix(Repeat) fill the Append part too?
+                # Probably yes ("fill available space").
+                
+                available_space = final_duration_samples - start_offset
+                
+                if available_space <= 0:
+                    next_wav = torch.zeros_like(next_wav)[..., :0]
+                else:
+                     if next_wav.dim() == 2:
+                         next_wav = next_wav.unsqueeze(0)
+                        
+                     original_len = next_wav.shape[-1]
+                     repeats = (available_space // original_len) + 2
+                     
+                     if repeats > 1:
+                         next_wav = next_wav.repeat(1, 1, int(repeats))
+                     
+                     next_wav = next_wav[..., :available_space]
+            
             # Apply volume
             next_wav = next_wav * next_vol
             
             # Apply Start Time (Pre-padding)
-            # We must pad with zeros equivalent to start_time seconds
-            # Note: This is applied AFTER resampling to current_sr
             start_time = next_input["start_time"]
-            if start_time > 0:
+            if start_time > 0 and not is_append: # Start time only applies to Mix
                  pad_samples = int(start_time * current_sr)
                  padding = torch.zeros((next_wav.shape[0], next_wav.shape[1], pad_samples), device=next_wav.device)
                  next_wav = torch.cat((padding, next_wav), dim=2)
             
-            # Match channels (Naive approach: Expand 1->2 if needed)
+            # Match channels
             if current_waveform.shape[1] == 1 and next_wav.shape[1] > 1:
                 current_waveform = current_waveform.repeat(1, next_wav.shape[1], 1)
             elif next_wav.shape[1] == 1 and current_waveform.shape[1] > 1:
                 next_wav = next_wav.repeat(1, current_waveform.shape[1], 1)
             
             if is_append:
-                # Append: Concatenate along last dim (time)
-                # Assumes dim 2 is time: [batch, channels, time]
                 current_waveform = torch.cat((current_waveform, next_wav), dim=2)
             else:
                 # Mix: Overlap
-                # Pad the shorter one to match longer one
-                curr_len = current_waveform.shape[2]
-                next_len = next_wav.shape[2]
+                # We need to expand current_waveform if next_wav is longer?
+                # OR next_wav might be longer than current_waveform IF current_waveform was short (non-repeating Audio 1).
                 
+                curr_len = current_waveform.shape[-1]
+                next_len = next_wav.shape[-1]
                 max_len = max(curr_len, next_len)
                 
-                # Check formatting. torch.cat needs same dimensions.
-                # Padding:
+                # Pad current if needed
                 if curr_len < max_len:
                     padding = torch.zeros((current_waveform.shape[0], current_waveform.shape[1], max_len - curr_len), device=current_waveform.device)
                     current_waveform = torch.cat((current_waveform, padding), dim=2)
                 
+                # Pad next if needed
                 if next_len < max_len:
                     padding = torch.zeros((next_wav.shape[0], next_wav.shape[1], max_len - next_len), device=next_wav.device)
                     next_wav = torch.cat((next_wav, padding), dim=2)

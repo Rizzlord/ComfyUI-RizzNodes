@@ -61,11 +61,13 @@ function setupAudioMixer(node) {
         }
 
         // Cache Audio 1 widgets (Fixed)
-        // volume_1, trim_start_1, trim_end_1
+        // volume_1, repeat_1, trim_start_1, trim_end_1
         const wVol1 = allWidgets.find(w => w.name === "volume_1");
+        const wRep1 = allWidgets.find(w => w.name === "repeat_1");
         const wTS1 = allWidgets.find(w => w.name === "trim_start_1");
         const wTE1 = allWidgets.find(w => w.name === "trim_end_1");
         if (wVol1) node.cachedWidgets.audio1.volume = wVol1;
+        if (wRep1) node.cachedWidgets.audio1.repeat = wRep1;
         if (wTS1) node.cachedWidgets.audio1.trimStart = wTS1;
         if (wTE1) node.cachedWidgets.audio1.trimEnd = wTE1;
 
@@ -80,12 +82,14 @@ function setupAudioMixer(node) {
             const wMode = allWidgets.find(w => w.name === `mode_${i}`);
             const wStart = allWidgets.find(w => w.name === `start_time_${i}`);
             const wVolume = allWidgets.find(w => w.name === `volume_${i}`);
+            const wRepeat = allWidgets.find(w => w.name === `repeat_${i}`);
             const wTrimStart = allWidgets.find(w => w.name === `trim_start_${i}`);
             const wTrimEnd = allWidgets.find(w => w.name === `trim_end_${i}`);
 
             if (wMode && wVolume) {
                 const entry = { mode: wMode, volume: wVolume };
                 if (wStart) entry.startTime = wStart;
+                if (wRepeat) entry.repeat = wRepeat;
                 if (wTrimStart) entry.trimStart = wTrimStart;
                 if (wTrimEnd) entry.trimEnd = wTrimEnd;
                 node.cachedWidgets.audio[i] = entry;
@@ -139,6 +143,7 @@ function setupAudioMixer(node) {
 
         // Add Audio 1 Widgets (Fixed)
         if (node.cachedWidgets.audio1.volume) this.widgets.push(node.cachedWidgets.audio1.volume);
+        if (node.cachedWidgets.audio1.repeat) this.widgets.push(node.cachedWidgets.audio1.repeat);
         if (node.cachedWidgets.audio1.trimStart) this.widgets.push(node.cachedWidgets.audio1.trimStart);
         if (node.cachedWidgets.audio1.trimEnd) this.widgets.push(node.cachedWidgets.audio1.trimEnd);
 
@@ -149,6 +154,7 @@ function setupAudioMixer(node) {
                 this.widgets.push(slot.mode);
                 if (slot.startTime) this.widgets.push(slot.startTime);
                 this.widgets.push(slot.volume);
+                if (slot.repeat) this.widgets.push(slot.repeat);
                 if (slot.trimStart) this.widgets.push(slot.trimStart);
                 if (slot.trimEnd) this.widgets.push(slot.trimEnd);
             }
