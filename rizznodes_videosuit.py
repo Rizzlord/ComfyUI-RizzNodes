@@ -186,8 +186,6 @@ BLEND_MODES = {
     'Color Burn': blend_color_burn,
     'Darken': blend_darken,
     'Lighten': blend_lighten,
-    'Difference': blend_difference,
-    'Exclusion': blend_exclusion,
 }
 
 
@@ -547,7 +545,7 @@ class RizzVideoEffects:
                 'Normal': 'normal', 'Multiply': 'multiply', 'Screen': 'screen',
                 'Overlay': 'overlay', 'Soft Light': 'softlight', 'Hard Light': 'hardlight',
                 'Color Dodge': 'dodge', 'Color Burn': 'burn', 'Darken': 'darken',
-                'Lighten': 'lighten', 'Difference': 'difference', 'Exclusion': 'exclusion',
+                'Lighten': 'lighten',
             }
             position_map = {
                 "Center": "(W-w)/2:(H-h)/2", "Top-Left": "0:0", "Top-Right": "W-w:0",
