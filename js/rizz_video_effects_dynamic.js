@@ -104,7 +104,7 @@ function setupEditClips(node) {
     node.updateDynamicSlots = function () {
         if (!cacheReady) initCache();
 
-        const videoCount = parseInt(this.properties["visibleVideoCount"] || 1);
+        const videoCount = parseInt(this.properties["visibleVideoCount"] ?? 1);
 
         // === Update Widgets ===
         const countControl = ensureVideoCountWidget();
@@ -143,18 +143,17 @@ function setupEditClips(node) {
 
         // Resize
         const HEADER_H = 26;
-        const INPUT_H = 22;
-        const WIDGET_H = 26;
-        const PADDING = 20;
+        const INPUT_H = 20;
+        const WIDGET_H = 21;
+        const PADDING = 10;
 
         const inputCount = videoCount;
-        // Count + Fixed(2) + Transitions((videoCount-1)*2)
-        // If count=1, transitions=0.
         const transitionWidgetCount = (videoCount > 1) ? (videoCount - 1) * 2 : 0;
+        // Count + Fixed(3) + Transitions
         const widgetCount = 1 + this.cachedWidgets.fixed.length + transitionWidgetCount;
 
         const targetH = HEADER_H + (inputCount * INPUT_H) + (widgetCount * WIDGET_H) + PADDING;
-        this.setSize([this.size[0], Math.max(150, targetH)]);
+        this.setSize([this.size[0], Math.max(100, targetH)]);
 
         if (app.canvas) app.canvas.setDirty(true, true);
     };
@@ -180,7 +179,7 @@ function setupEditClips(node) {
 function setupVideoEffects(node) {
     if (!node.properties) node.properties = {};
     if (node.properties["visibleAudioCount"] === undefined) node.properties["visibleAudioCount"] = 1;
-    if (node.properties["visibleImageCount"] === undefined) node.properties["visibleImageCount"] = 1;
+    if (node.properties["visibleImageCount"] === undefined) node.properties["visibleImageCount"] = 0; // Default to 0 overlays
 
     node.cachedWidgets = {
         audio: {},
@@ -315,8 +314,8 @@ function setupVideoEffects(node) {
     node.updateDynamicSlots = function () {
         if (!cacheReady) initCache();
 
-        const audioCount = parseInt(this.properties["visibleAudioCount"] || 1);
-        const imageCount = parseInt(this.properties["visibleImageCount"] || 0);
+        const audioCount = parseInt(this.properties["visibleAudioCount"] ?? 1);
+        const imageCount = parseInt(this.properties["visibleImageCount"] ?? 0);
 
         // === Update Widgets ===
         const audioCountControl = ensureAudioCountWidget();
@@ -365,36 +364,42 @@ function setupVideoEffects(node) {
 
         // === Update Input Connections ===
         // Rebuild inputs array with only visible inputs
-        this.inputs = [];
+        // Note: We use a temp array and then set this.inputs to avoid reference issues
+        const newInputs = [];
 
         // Always add video input first
         for (const inp of this.cachedInputs.fixed) {
-            this.inputs.push(inp);
+            newInputs.push(inp);
         }
 
         // Add audio inputs based on count
         for (let i = 1; i <= audioCount; i++) {
             const inp = this.cachedInputs.audio[i];
-            if (inp) this.inputs.push(inp);
+            if (inp) newInputs.push(inp);
         }
 
         // Add image inputs based on count
         for (let i = 1; i <= imageCount; i++) {
             const inp = this.cachedInputs.image[i];
-            if (inp) this.inputs.push(inp);
+            if (inp) newInputs.push(inp);
         }
+
+        this.inputs = newInputs;
 
         // Calculate size - account for inputs too
         const HEADER_H = 26;
-        const INPUT_H = 22;  // Height per input connection
-        const WIDGET_H = 26;
-        const PADDING = 20;
+        const INPUT_H = 20;  // Height per input connection
+        const WIDGET_H = 21;
+        const PADDING = 10;
 
         const inputCount = 1 + audioCount + imageCount;  // video + audio + image inputs
-        const widgetCount = 2 + audioCount * 2 + imageCount * 3 + this.cachedWidgets.fixed.length;
+        // audio: 2 widgets per track (start, volume)
+        // image: 4 widgets per layer (blend, opacity, position, tile_scale)
+        //固定: speed, interpolation, reverse, fade_in, fade_out, brightness, contrast, saturation, end_with_audio (9 total)
+        const widgetCount = 2 + audioCount * 2 + imageCount * 4 + this.cachedWidgets.fixed.length;
 
         const targetH = HEADER_H + (inputCount * INPUT_H) + (widgetCount * WIDGET_H) + PADDING;
-        this.setSize([this.size[0], Math.max(200, targetH)]);
+        this.setSize([this.size[0], Math.max(180, targetH)]);
 
         if (app.canvas) app.canvas.setDirty(true, true);
     };

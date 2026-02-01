@@ -127,7 +127,7 @@ function setupAudioMixer(node) {
     node.updateDynamicSlots = function () {
         if (!cacheReady) initCache();
 
-        const count = parseInt(this.properties["visibleAudioCount"] || 2);
+        const count = parseInt(this.properties["visibleAudioCount"] ?? 2);
 
         // === Update Widgets ===
         const countControl = ensureCountWidget();
