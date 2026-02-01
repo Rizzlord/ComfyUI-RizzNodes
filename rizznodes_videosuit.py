@@ -196,17 +196,14 @@ BLEND_MODES = {
 # ============================================================================
 
 class RizzLoadVideo:
-    """Load a video file by path."""
+    """Load a video file by scanning a folder and selecting from a list."""
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "video_path": ("STRING", {
-                    "default": "",
-                    "placeholder": "Paste video path here",
-                    "tooltip": "Absolute path to video file (e.g. /path/to/video.mp4)"
-                }),
+                "folder_path": ("STRING", {"default": folder_paths.get_input_directory(), "multiline": False}),
+                "file": (["None"], {"default": "None"}),
             }
         }
     
@@ -216,15 +213,22 @@ class RizzLoadVideo:
     CATEGORY = "RizzNodes/Video"
     
     @classmethod
-    def IS_CHANGED(cls, video_path=""):
-        if video_path and os.path.exists(video_path):
-            return os.path.getmtime(video_path)
+    def IS_CHANGED(cls, folder_path="", file=""):
+        if folder_path and file and file != "None":
+            path = os.path.join(folder_path, file)
+            if os.path.exists(path):
+                return os.path.getmtime(path)
         return float("nan")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        return True
     
-    def load_video(self, video_path):
-        if not video_path:
-            raise ValueError("Video path is required")
+    def load_video(self, folder_path, file):
+        if not file or file == "None" or not folder_path:
+            raise ValueError("Please select a video file")
         
+        video_path = os.path.join(folder_path, file)
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
         
@@ -232,6 +236,73 @@ class RizzLoadVideo:
         filename = os.path.basename(video_path)
         
         return (video_info, filename, video_path)
+
+
+# ============================================================================
+# Node 1.5: RizzLoadAudio
+# ============================================================================
+
+class RizzLoadAudio:
+    """Load an audio file by scanning a folder and selecting from a list."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "folder_path": ("STRING", {"default": folder_paths.get_input_directory(), "multiline": False}),
+                "file": (["None"], {"default": "None"}), 
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "FLOAT")
+    RETURN_NAMES = ("audio", "duration (seconds)")
+    FUNCTION = "load_audio"
+    CATEGORY = "RizzNodes/Audio"
+    
+    @classmethod
+    def VALIDATE_INPUTS(s, **kwargs):
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, folder_path="", file=""):
+        if folder_path and file and file != "None":
+            path = os.path.join(folder_path, file)
+            if os.path.exists(path):
+                return os.path.getmtime(path)
+        return float("nan")
+
+    def load_audio(self, folder_path, file):
+        if not file or file == "None" or not folder_path:
+            return (None, 0.0)
+        
+        path = os.path.join(folder_path, file)
+        if not os.path.exists(path):
+            raise ValueError(f"File not found: {path}")
+            
+        try:
+            import soundfile as sf
+            # Soundfile reads as [samples, channels] or [samples]
+            waveform, sample_rate = sf.read(path)
+            
+            # Calculate duration in seconds
+            duration = waveform.shape[0] / sample_rate
+            
+            # Convert to tensor
+            waveform = torch.from_numpy(waveform).float()
+            
+            # Normalize to [batch, channels, samples]
+            if waveform.dim() == 1:
+                # [samples] -> [1, 1, samples]
+                waveform = waveform.unsqueeze(0).unsqueeze(0)
+            elif waveform.dim() == 2:
+                # [samples, channels] -> [channels, samples]
+                waveform = waveform.t().unsqueeze(0)
+                
+            # Standard ComfyUI AUDIO format: {"waveform": tensor [batch, channels, samples], "sample_rate": int}
+            return ({"waveform": waveform, "sample_rate": sample_rate}, duration)
+        except Exception as e:
+            print(f"[RizzNodes] Error loading audio from {path}: {e}")
+            raise ValueError(f"Failed to load audio: {e}")
 
 
 # ============================================================================
@@ -1468,6 +1539,7 @@ class RizzEditClips:
 
 NODE_CLASS_MAPPINGS = {
     "RizzLoadVideo": RizzLoadVideo,
+    "RizzLoadAudio": RizzLoadAudio,
     "RizzExtractFrames": RizzExtractFrames,
     "RizzVideoEffects": RizzVideoEffects,
     "RizzSaveVideo": RizzSaveVideo,
@@ -1479,6 +1551,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzLoadVideo": "🎥 Load Video (Rizz)",
+    "RizzLoadAudio": "🎵 Load Audio (Rizz)",
     "RizzExtractFrames": "🎞️ Extract Frames (Start/End)",
     "RizzVideoEffects": "🎬 Video Effects (Rizz)",
     "RizzSaveVideo": "💾 Save Video (Rizz)",

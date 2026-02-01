@@ -36,6 +36,43 @@ NODE_DISPLAY_NAME_MAPPINGS.update(AUDIO_NODE_DISPLAY_NAME_MAPPINGS)
 # Tell ComfyUI where to find our JavaScript files
 WEB_DIRECTORY = "js"
 
+try:
+    import server
+    from aiohttp import web
+    import os
+
+    @server.PromptServer.instance.routes.post("/rizz/list_files")
+    async def list_files(request):
+        try:
+            data = await request.json()
+            path = data.get("path")
+            type_filter = data.get("type", "audio") # "audio" or "video"
+            
+            if not path or not os.path.isdir(path):
+                return web.json_response({"files": []})
+            
+            files = []
+            if type_filter == "audio":
+                extensions = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
+            else: # video
+                extensions = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+            
+            for f in os.listdir(path):
+                if not f.startswith('.'):
+                    file_path = os.path.join(path, f)
+                    if os.path.isfile(file_path):
+                        _, ext = os.path.splitext(f)
+                        if ext.lower() in extensions:
+                            files.append(f)
+            
+            return web.json_response({"files": sorted(files)})
+        except Exception as e:
+            print(f"[RizzNodes] Error listing files: {e}")
+            return web.json_response({"files": []})
+
+except ImportError:
+    print("[RizzNodes] Failed to import server for backend routes.")
+
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
 
 print("### RizzNodes: Custom nodes loaded successfully. ###")

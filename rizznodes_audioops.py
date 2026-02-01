@@ -1,4 +1,10 @@
+import os
+import subprocess
+import tempfile
+import uuid
 import torch
+import folder_paths
+import soundfile as sf
 
 # Maximum number of audio inputs to expose
 MAX_AUDIO_INPUTS = 50
@@ -318,10 +324,174 @@ class RizzAudioMixer:
         duration = current_waveform.shape[-1] / current_sr
         return ({"waveform": current_waveform, "sample_rate": current_sr}, float(duration))
 
+# ============================================================================
+# Node 2: RizzSaveAudio
+# ============================================================================
+
+class RizzSaveAudio:
+    """Save audio with customizable encoding settings."""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "filename_prefix": ("STRING", {"default": "RizzAudio/Aud", "tooltip": "Prefix for the output filename. Counter will be appended automatically."}),
+                "format": (["mp3", "wav", "flac", "ogg"], {"default": "mp3", "tooltip": "Audio format to save."}),
+                "sample_rate_mode": (["48000", "44100", "Keep Original"], {"default": "48000", "tooltip": "Target sample rate for the output audio."}),
+            },
+            "optional": {
+                "bitrate": (["64k", "96k", "128k", "192k", "256k", "320k"], {"default": "320k", "tooltip": "Bitrate for compressed formats (MP3/OGG)."}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "AUDIO")
+    RETURN_NAMES = ("filepath", "audio")
+    FUNCTION = "save_audio"
+    OUTPUT_NODE = True
+    CATEGORY = "RizzNodes/Audio"
+    
+    def save_audio(self, audio, filename_prefix, format, sample_rate_mode, bitrate="320k", prompt=None, extra_pnginfo=None):
+        waveform = audio["waveform"]
+        sample_rate = audio["sample_rate"]
+        
+        output_dir = folder_paths.get_output_directory()
+        
+        # Use folder_paths for sequential naming
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, output_dir
+        )
+        
+        # The user requested _00001_ format
+        output_filename = f"{filename}_{counter:05}_.{format}"
+        output_path = os.path.join(full_output_folder, output_filename)
+        
+        # Create a temporary WAV file for ffmpeg to read
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_wav = os.path.join(temp_dir, f"temp_save_audio_{uuid.uuid4().hex}.wav")
+        
+        # Prepare waveform for soundfile [time, channels]
+        wf_raw = waveform.clone()
+        if wf_raw.dim() == 3:
+            wf_raw = wf_raw[0] # remove batch dim
+        if wf_raw.dim() == 2 and wf_raw.shape[0] < wf_raw.shape[1]:
+            wf_raw = wf_raw.T # [channels, time] -> [time, channels]
+        
+        sf.write(temp_wav, wf_raw.cpu().numpy(), sample_rate)
+        
+        # Build ffmpeg command
+        cmd = ['ffmpeg', '-y', '-i', temp_wav]
+        
+        # Sample rate conversion
+        if sample_rate_mode != "Keep Original":
+            cmd.extend(['-ar', sample_rate_mode])
+        
+        # Bitrate for compressed formats
+        if format in ["mp3", "ogg"]:
+            cmd.extend(['-b:a', bitrate])
+            if format == "mp3":
+                cmd.extend(['-c:a', 'libmp3lame'])
+            else:
+                cmd.extend(['-c:a', 'libvorbis'])
+        elif format == "flac":
+            cmd.extend(['-c:a', 'flac'])
+        else: # wav
+            cmd.extend(['-c:a', 'pcm_s16le'])
+            
+        cmd.append(output_path)
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                 print(f"[RizzNodes AudioOps] FFmpeg error: {result.stderr}")
+                 # Fallback: just move/save as wav if ffmpeg failed on simple save
+                 if format == "wav":
+                      sf.write(output_path, wf_raw.cpu().numpy(), sample_rate)
+                 else:
+                      raise RuntimeError(f"FFmpeg failed to encode audio: {result.stderr}")
+        except Exception as e:
+            print(f"[RizzNodes AudioOps] Error saving audio: {e}")
+            raise e
+        finally:
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
+        
+        # Return path and original audio for chaining
+        return (output_path, audio)
+
+
+# ============================================================================
+# Node 3: RizzPreviewAudio
+# ============================================================================
+
+class RizzPreviewAudio:
+    """Preview audio in ComfyUI web interface with a custom player."""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+            },
+            "optional": {
+                "autoplay": ("BOOLEAN", {"default": False}),
+                "loop": ("BOOLEAN", {"default": False}),
+            }
+        }
+    
+    RETURN_TYPES = ()
+    FUNCTION = "preview"
+    OUTPUT_NODE = True
+    CATEGORY = "RizzNodes/Audio"
+    
+    def preview(self, audio, autoplay=False, loop=False):
+        import random
+        waveform = audio["waveform"]
+        sample_rate = audio["sample_rate"]
+        
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Generate unique filename for preview
+        random_suffix = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
+        preview_filename = f"RizzAudio_temp_{random_suffix}_.wav"
+        preview_path = os.path.join(temp_dir, preview_filename)
+        
+        # Prepare waveform for soundfile [time, channels]
+        wf_raw = waveform.clone()
+        if wf_raw.dim() == 3:
+            wf_raw = wf_raw[0]
+        if wf_raw.dim() == 2 and wf_raw.shape[0] < wf_raw.shape[1]:
+            wf_raw = wf_raw.T
+            
+        sf.write(preview_path, wf_raw.cpu().numpy(), sample_rate)
+        
+        return {
+            "ui": {
+                "audio": [{
+                    "filename": preview_filename,
+                    "subfolder": "",
+                    "type": "temp",
+                    "autoplay": autoplay,
+                    "loop": loop
+                }]
+            }
+        }
+
+
 NODE_CLASS_MAPPINGS = {
-    "RizzAudioMixer": RizzAudioMixer
+    "RizzAudioMixer": RizzAudioMixer,
+    "RizzSaveAudio": RizzSaveAudio,
+    "RizzPreviewAudio": RizzPreviewAudio
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RizzAudioMixer": "Audio Mixer (Rizz)"
+    "RizzAudioMixer": "Audio Mixer (Rizz)",
+    "RizzSaveAudio": "🎵 Save Audio (Rizz)",
+    "RizzPreviewAudio": "🔊 Preview Audio (Rizz)"
 }
