@@ -374,11 +374,11 @@ class RizzVideoEffects:
             "required": {
                 "video": ("VIDEO",),
                 "audio_count": ("INT", {
-                    "default": 1, "min": 0, "max": MAX_AUDIO_SLOTS, "step": 1,
+                    "default": 0, "min": 0, "max": MAX_AUDIO_SLOTS, "step": 1,
                     "tooltip": "Number of audio tracks to mix (0-10). Each gets its own start time and volume."
                 }),
                 "image_count": ("INT", {
-                    "default": 1, "min": 0, "max": MAX_IMAGE_SLOTS, "step": 1,
+                    "default": 0, "min": 0, "max": MAX_IMAGE_SLOTS, "step": 1,
                     "tooltip": "Number of image overlays (0-5). Each gets its own blend mode, opacity, and position."
                 }),
             },

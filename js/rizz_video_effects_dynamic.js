@@ -178,7 +178,7 @@ function setupEditClips(node) {
 
 function setupVideoEffects(node) {
     if (!node.properties) node.properties = {};
-    if (node.properties["visibleAudioCount"] === undefined) node.properties["visibleAudioCount"] = 1;
+    if (node.properties["visibleAudioCount"] === undefined) node.properties["visibleAudioCount"] = 0;
     if (node.properties["visibleImageCount"] === undefined) node.properties["visibleImageCount"] = 0; // Default to 0 overlays
 
     node.cachedWidgets = {
@@ -278,7 +278,7 @@ function setupVideoEffects(node) {
         let w = node.widgets.find(x => x.name === name);
         if (!w) {
             const values = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
-            w = node.addWidget("combo", name, "1", (v) => {
+            w = node.addWidget("combo", name, "0", (v) => {
                 const num = parseInt(v);
                 if (!isNaN(num)) {
                     node.properties["visibleAudioCount"] = num;
