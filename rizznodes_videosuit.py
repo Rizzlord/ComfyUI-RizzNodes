@@ -483,7 +483,16 @@ class RizzVideoEffects:
                     filters.append(f"minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps={target_fps}'")
             
             filters.append(f"setpts={1/speed}*PTS")
-            audio_filters.append(f"atempo={speed}")
+            
+            # atempo only supports 0.5 to 2.0, so we may need multiple stages
+            curr_speed = speed
+            while curr_speed < 0.5:
+                audio_filters.append("atempo=0.5")
+                curr_speed /= 0.5
+            while curr_speed > 2.0:
+                audio_filters.append("atempo=2.0")
+                curr_speed /= 2.0
+            audio_filters.append(f"atempo={curr_speed}")
         
         # Reverse
         if reverse:
@@ -501,15 +510,16 @@ class RizzVideoEffects:
         if eq_parts:
             filters.append(f"eq={':'.join(eq_parts)}")
         
-        # Fade effects
+        # Fade effects (collect these to apply at the end of the chain)
+        audio_fade_filters = []
         if fade_in > 0:
             filters.append(f"fade=t=in:st=0:d={fade_in}")
-            audio_filters.append(f"afade=t=in:st=0:d={fade_in}")
+            audio_fade_filters.append(f"afade=t=in:st=0:d={fade_in}")
         if fade_out > 0:
             duration = video['duration'] / speed if speed != 1.0 else video['duration']
             fade_start = max(0, duration - fade_out - 0.05)
             filters.append(f"fade=t=out:st={fade_start}:d={fade_out}")
-            audio_filters.append(f"afade=t=out:st={fade_start}:d={fade_out}")
+            audio_fade_filters.append(f"afade=t=out:st={fade_start}:d={fade_out}")
         
         # Collect overlay images (processed in order based on image_count)
         overlay_images = []
@@ -643,9 +653,9 @@ class RizzVideoEffects:
                     complex_filter.append(f"[{current_label}][{ovr_label}]overlay={overlay_pos}:format=auto[{out_label}]")
                 else:
                     # Blend mode requires same-size inputs, pad if needed
-                    # When using blend modes, 'overlay' filter is not used, so we must position via 'pad'
-                    # Extract x and y expressions from overlay_pos (e.g. "x=(W-w)/2:y=(H-h)/2")
-                    # pad syntax: width:height:x:y:color
+                    # When using blend modes, we first create a blended version of the whole frame
+                    # and then overlay it back onto the original frame using the image's alpha.
+                    # This prevents transparency issues that turn green in YUV conversion.
                     
                     pad_x = "0"
                     pad_y = "0"
@@ -657,14 +667,20 @@ class RizzVideoEffects:
                             if p.startswith("y="):
                                 pad_y = p[2:]
                     
-                    # In pad filter, iw/ih refer to the input (image), ow/oh refer to output (video size)
-                    # Our overlay_pos expressions use W/H (video) and w/h (image)
-                    # We need to map W->ow, H->oh, w->iw, h->ih for pad filter expressions
                     pad_x = pad_x.replace("W", "ow").replace("H", "oh").replace("w", "iw").replace("h", "ih")
                     pad_y = pad_y.replace("W", "ow").replace("H", "oh").replace("w", "iw").replace("h", "ih")
                     
+                    # 1. Create a padded version of the image with its alpha
                     complex_filter[-1] = f"{scale_filter},colorchannelmixer=aa={opacity},pad={width}:{height}:{pad_x}:{pad_y}:color=black@0[{ovr_label}]"
-                    complex_filter.append(f"[{current_label}][{ovr_label}]blend=all_mode={ffmpeg_blend}:all_opacity={opacity}[{out_label}]")
+                    
+                    # 2. Blend the video with the padded image
+                    # The result of blend often has transparency where the padding was.
+                    blend_label = f"bld{idx}"
+                    complex_filter.append(f"[{current_label}][{ovr_label}]blend=all_mode={ffmpeg_blend}:all_opacity={opacity}[{blend_label}]")
+                    
+                    # 3. Overlay the blended result onto the video frames
+                    # This restores the background and produces an opaque result.
+                    complex_filter.append(f"[{current_label}][{blend_label}]overlay=format=auto[{out_label}]")
                 
                 current_label = out_label
             
@@ -723,6 +739,32 @@ class RizzVideoEffects:
             filter_complex_str += ";".join(complex_filter)
         
         if audio_mix_parts:
+            # First, process original audio with speed/reverse filters if present
+            if video['has_audio'] and audio_filters:
+                # We need to inject this into the filter complex BEFORE mixing
+                # audio_mix_parts[0] should be "[0:a]volume=1.0[a0]" if video['has_audio'] is true
+                # We'll re-build audio_mix_parts and audio_inputs to be cleaner
+                
+                new_audio_mix_parts = []
+                new_audio_inputs = []
+                
+                # Original video audio with filters applied
+                new_audio_mix_parts.append(f"[0:a]{','.join(audio_filters)},volume=1.0[a0]")
+                new_audio_inputs.append("[a0]")
+                
+                # Add the rest of the audio tracks
+                for i in range(1, len(audio_inputs)):
+                    part = audio_mix_parts[i]
+                    # Part looks like "[audio_idx:a]adelay=...,volume=...[label]"
+                    # We need the [label] part for the mix
+                    label_start = part.rfind('[')
+                    if label_start != -1:
+                        new_audio_mix_parts.append(part)
+                        new_audio_inputs.append(part[label_start:])
+                
+                audio_mix_parts = new_audio_mix_parts
+                audio_inputs = new_audio_inputs
+
             if filter_complex_str:
                 filter_complex_str += ";"
             filter_complex_str += ";".join(audio_mix_parts)
@@ -732,10 +774,26 @@ class RizzVideoEffects:
             
             if len(audio_inputs) > 1:
                 # Mix multiple audio streams
-                filter_complex_str += f";{''.join(audio_inputs)}amix=inputs={len(audio_inputs)}:duration={duration_mode}[aout]"
-            elif len(audio_inputs) == 1:
-                # Single audio stream
-                filter_complex_str = filter_complex_str.replace(audio_inputs[0].replace('[', '').replace(']', ''), 'aout')
+                mix_out = "amixout"
+                filter_complex_str += f";{''.join(audio_inputs)}amix=inputs={len(audio_inputs)}:duration={duration_mode}[{mix_out}]"
+            else:
+                # Single audio stream (might be filtered or just volume adjusted)
+                mix_out = audio_inputs[0].replace('[', '').replace(']', '')
+            
+            # Apply fade filters to the mixed output
+            if audio_fade_filters:
+                filter_complex_str += f";[{mix_out}]{','.join(audio_fade_filters)}[aout]"
+            else:
+                # If no fades, just rename to aout
+                # If we didn't mix, mix_out is already the label we want to map
+                if mix_out != "aout":
+                    filter_complex_str += f";[{mix_out}]anull[aout]"
+        elif video['has_audio'] and (audio_filters or audio_fade_filters):
+            # No mixed audio, but original audio needs filters
+            all_a_filters = audio_filters + audio_fade_filters
+            if filter_complex_str: filter_complex_str += ";"
+            filter_complex_str += f"[0:a]{','.join(all_a_filters)}[aout]"
+            audio_mix_parts = ["processed_audio"] # Flag to ensure -map [aout] is used
         
         # Add filter complex to command
         if filter_complex_str:
@@ -765,8 +823,6 @@ class RizzVideoEffects:
             if speed != 1.0 and speed > 0:
                 video_dur = video_dur / speed
             cmd.extend(['-t', str(video_dur)])
-            if audio_filters and video['has_audio']:
-                cmd.extend(['-af', ','.join(audio_filters)])
         
         # Output settings
         cmd.extend([
