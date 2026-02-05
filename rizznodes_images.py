@@ -18,8 +18,9 @@ class RizzSaveImage:
                 "resize": ("BOOLEAN", {"default": False}),
                 "width": ("INT", {"default": 512, "min": 0, "max": 16384}),
                 "height": ("INT", {"default": 512, "min": 0, "max": 16384}),
-                "format": (["png", "webp", "jpg", "tga"],),
+                "format": (["png", "webp", "jpg", "tga", "bmp"],),
                 "quality": ("INT", {"default": 90, "min": 1, "max": 100}),
+                "save_metadata": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "upscale_model": ("UPSCALE_MODEL",),
@@ -35,10 +36,10 @@ class RizzSaveImage:
     OUTPUT_NODE = True
     CATEGORY = "RizzNodes/Image"
 
-    def save_images(self, images, model, resize, width, height, format, quality, upscale_model=None, prompt=None, extra_pnginfo=None):
-        return self.save_images_main(images, model, resize, width, height, format, quality, upscale_model, prompt, extra_pnginfo, output_type="output")
+    def save_images(self, images, model, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None):
+        return self.save_images_main(images, model, resize, width, height, format, quality, save_metadata, upscale_model, prompt, extra_pnginfo, output_type="output")
 
-    def save_images_main(self, images, model, resize, width, height, format, quality, upscale_model=None, prompt=None, extra_pnginfo=None, output_type="output"):
+    def save_images_main(self, images, model, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None, output_type="output"):
         filename_prefix = model
         
         if output_type == "output":
@@ -74,13 +75,40 @@ class RizzSaveImage:
             img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
             
             metadata = None
-            if not args_disable_metadata: # Helper to check if metadata should be saved
-                metadata = PngInfo()
-                if prompt is not None:
-                    metadata.add_text("prompt", json.dumps(prompt))
-                if extra_pnginfo is not None:
-                    for x in extra_pnginfo:
-                        metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+            exif_bytes = None
+            
+            if save_metadata and not get_args_disable_metadata():
+                if format == "png":
+                    metadata = PngInfo()
+                    if prompt is not None:
+                        metadata.add_text("prompt", json.dumps(prompt))
+                    if extra_pnginfo is not None:
+                        for x in extra_pnginfo:
+                            metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+                else:
+                    # For WebP, JPG, etc. try to save in Exif
+                    try:
+                        import piexif
+                        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+                        
+                        info = {}
+                        if prompt is not None:
+                            info["prompt"] = prompt
+                        if extra_pnginfo is not None:
+                            for x in extra_pnginfo:
+                                info[x] = extra_pnginfo[x]
+                        
+                        if info:
+                            # UserComment tag ID is 37510
+                            user_comment = json.dumps(info)
+                            exif_dict["Exif"][37510] = user_comment.encode("utf-8")
+                            exif_bytes = piexif.dump(exif_dict)
+                            
+                    except ImportError:
+                        # Fallback if piexif not installed
+                        pass
+                    except Exception as e:
+                        print(f"Failed to create EXIF data: {e}")
 
             file = f"{filename}_{counter:05}_.{format}"
             
@@ -89,10 +117,12 @@ class RizzSaveImage:
             if format == "png":
                  img.save(save_path, pnginfo=metadata, optimize=True)
             elif format == "webp":
-                 img.save(save_path, quality=quality, lossless=False, exif=metadata) # prompt/metadata handling varies for webp
+                 img.save(save_path, quality=quality, lossless=False, exif=exif_bytes)
             elif format == "jpg":
-                 img.save(save_path, quality=quality, optimize=True)
+                 img.save(save_path, quality=quality, optimize=True, exif=exif_bytes)
             elif format == "tga":
+                 img.save(save_path)
+            elif format == "bmp":
                  img.save(save_path)
             
             results.append({
@@ -161,6 +191,11 @@ class RizzPreviewImage(RizzSaveImage):
     def save_images(self, images):
         # Simple temp save for preview
         return self.save_images_main(images, model="Preview", resize=False, width=0, height=0, format="png", quality=90, output_type="temp")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, images):
+        # Validate inputs to ensure the node doesn't appear empty due to validation issues
+        return True
 
 class RizzLoadImage(RizzSaveImage):
     @classmethod
@@ -320,7 +355,7 @@ class RizzLoadImage(RizzSaveImage):
              alpha = torch.ones_like(tensor_rgb[..., 0:1])
              tensor_rgba = torch.cat((tensor_rgb, alpha), dim=-1)
              
-        return {
+        return (tensor_rgb, tensor_rgba), {
             "ui": {
                 "images": [
                     {
@@ -329,18 +364,22 @@ class RizzLoadImage(RizzSaveImage):
                         "type": "output" if "output" in image_path else "input"
                     }
                 ]
-            },
-            "result": (tensor_rgb, tensor_rgba),
+            }
         }
 
     @classmethod
     def IS_CHANGED(s, folder, custom_path, image, resize, width, height, upscale_model=None):
+        import hashlib
         m = hashlib.sha256()
         m.update(folder.encode())
         m.update(custom_path.encode())
-        m.update(image.encode())  
+        m.update(image.encode())
         return m.digest().hex()
 
 # Shim for args
 import hashlib
 args_disable_metadata = False
+
+# Define globally for all classes in this module
+def get_args_disable_metadata():
+    return args_disable_metadata

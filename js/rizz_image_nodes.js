@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 const HIDDEN_TAG = "tschide";
 
@@ -8,6 +9,14 @@ app.registerExtension({
     nodeCreated(node) {
         if (node.comfyClass === "RizzSaveImage" || node.comfyClass === "RizzPreviewImage" || node.comfyClass === "RizzLoadImage") {
             setupImageNode(node);
+        }
+
+        // Special handling for RizzPreviewImage to ensure it's visible
+        if (node.comfyClass === "RizzPreviewImage") {
+            // Ensure the node has minimum size to show the preview
+            if (node.size[0] < 200 || node.size[1] < 200) {
+                node.setSize([256, 256]); // Set a reasonable default size for preview
+            }
         }
     }
 });
@@ -23,27 +32,50 @@ function setupImageNode(node) {
             const img = this.imgs[0];
             // Resize node to match image (plus header space)
             const HEADER_HEIGHT = 40; // rough estimate
-            // We don't want to make it HUGE if image is huge, but user asked for "images longest side resolution" scaling.
-            // Standard behavior usually fits image IN node.
-            // User wants node to SCALE to image.
 
-            // Wait for image to load if it's not ready (message usually contains filename, Comfy loads it async)
-            // Actually node.imgs are populated by Comfy's default handler usually.
-            // But if we want to force size:
-
-            // We can just rely on Comfy's default resize behavior if RizzPreviewImage logic is standard.
-            // But user says "did you change it on save image node too? scale of node to image resolution".
-            // This implies forceful resizing.
-
-            // Let's try setting size. But imgs might be Image objects.
             if (img.width && img.height) {
-                const WIDGETS_HEIGHT = this.comfyClass === "RizzLoadImage" ? 220 : 60; // Estimate space for widgets
+                const WIDGETS_HEIGHT = this.comfyClass === "RizzLoadImage" ? 260 : 60; // Increased space for widgets to accommodate refresh button and file selector
                 const OFFSET = 30; // User requested 30px further down
-                this.setSize([img.width, img.height + HEADER_HEIGHT + WIDGETS_HEIGHT + OFFSET]);
+                const newSize = [img.width, img.height + HEADER_HEIGHT + WIDGETS_HEIGHT + OFFSET];
+                this.setSize(newSize);
                 this.setDirtyCanvas(true, true);
+
+                // Save state
+                if (!this.properties) this.properties = {};
+                this.properties.last_size = newSize;
+            }
+
+            // Save image info for reload
+            if (this.ui.images && this.ui.images.length > 0) {
+                if (!this.properties) this.properties = {};
+                this.properties.last_output = this.ui.images;
             }
         }
     };
+
+    // Restore state on load
+    if (node.properties && node.properties.last_output) {
+        const images = node.properties.last_output;
+        if (images && images.length > 0) {
+            const img_data = images[0];
+            const img = new Image();
+            img.onload = function () {
+                node.imgs = [img];
+                app.graph.setDirtyCanvas(true);
+            };
+            // Construct URL - handle both 'output' and 'temp' types
+            let params = new URLSearchParams({
+                filename: img_data.filename,
+                type: img_data.type,
+                subfolder: img_data.subfolder,
+            });
+            img.src = api.apiURL("/view?" + params.toString());
+        }
+    }
+
+    if (node.properties && node.properties.last_size) {
+        node.setSize(node.properties.last_size);
+    }
 
     // Cache widgets for toggling
     node.cachedWidgets = {};
@@ -80,7 +112,25 @@ function setupImageNode(node) {
         setVisible(widthWidget, isResize);
         setVisible(heightWidget, isResize);
 
-        node.setSize(node.computeSize());
+        // Only auto-resize if we don't have a saved size or an image displayed
+        // If we have an image (this.imgs), preserve current size or computed size from image
+        // If we just loaded (last_size exists), preserve it
+
+        // However, toggling widgets changes the needed height. 
+        // If we have a massive image, and we toggle widgets, we might want to keep the massive, or adjust slightly?
+        // ComfyUI default: setSize(computeSize()) shrinks to minimum.
+
+        const currentSize = node.size;
+        const minSize = node.computeSize();
+
+        // If current size is significantly larger than minSize, it's probably sizing an image.
+        // Don't shrink it.
+        // But if we hide widgets, we might want to shrink slightly? No, usually fine to stay big.
+
+        if (currentSize[0] < minSize[0] || currentSize[1] < minSize[1]) {
+            node.setSize(minSize);
+        }
+
         // Force redraw
         requestAnimationFrame(() => {
             node.setDirtyCanvas(true, true);
@@ -188,12 +238,18 @@ function setupImageNode(node) {
                     const data = await response.json();
                     if (data.files) {
                         imgWidget.options.values = data.files;
-                        // If current value is not in list, maybe select first?
-                        // Or keep it (might be a paste).
-                        if (!data.files.includes(imgWidget.value) && data.files.length > 0) {
-                            // Don't auto-switch aggressively if user pasted something?
-                            // But usually we want to see the list.
+                        // Force update the widget to reflect the new options
+                        if (data.files.length > 0) {
+                            // If current value is not in list, select first
+                            if (!data.files.includes(imgWidget.value)) {
+                                imgWidget.value = data.files[0];
+                            }
+                        } else {
+                            imgWidget.value = "None"; // Show "None" if no files found
                         }
+
+                        // Trigger a redraw to make sure the dropdown is visible
+                        node.setDirtyCanvas(true, true);
                     }
                 }
             } catch (err) {
