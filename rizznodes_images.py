@@ -14,7 +14,7 @@ class RizzSaveImage:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "model": (["Flux", "flux2", "qwen", "qwenedit", "sd1.5", "sdxl", "sd3", "anime"],),
+                "model": (["None", "Flux", "flux2", "qwen", "qwenedit", "sd1.5", "sdxl", "sd3", "anime"],),
                 "resize": ("BOOLEAN", {"default": False}),
                 "width": ("INT", {"default": 512, "min": 0, "max": 16384}),
                 "height": ("INT", {"default": 512, "min": 0, "max": 16384}),
@@ -42,7 +42,10 @@ class RizzSaveImage:
         filename_prefix = model
         
         if output_type == "output":
-            output_dir = os.path.join(folder_paths.get_output_directory(), "RizzImage", model)
+            if model == "None":
+                output_dir = os.path.join(folder_paths.get_output_directory(), "RizzImage")
+            else:
+                output_dir = os.path.join(folder_paths.get_output_directory(), "RizzImage", model)
         else: # "temp"
             output_dir = folder_paths.get_temp_directory()
             filename_prefix = "RizzPreview" # For temp files
@@ -94,7 +97,7 @@ class RizzSaveImage:
             
             results.append({
                 "filename": file,
-                "subfolder": os.path.join("RizzImage", model),
+                "subfolder": "RizzImage" if model == "None" else os.path.join("RizzImage", model),
                 "type": "output"
             })
             counter += 1
@@ -191,8 +194,8 @@ class RizzLoadImage(RizzSaveImage):
         output_root = folder_paths.get_output_directory()
         
         if folder == "None":
-            # Search in output root
-            target_folder = output_root
+            # Search in RizzImage root
+            target_folder = os.path.join(output_root, "RizzImage")
         elif folder == "Custom":
             # Use custom path (relative to output or absolute)
             if os.path.isabs(custom_path):

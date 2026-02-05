@@ -37,7 +37,9 @@ function setupImageNode(node) {
 
             // Let's try setting size. But imgs might be Image objects.
             if (img.width && img.height) {
-                this.setSize([img.width, img.height + HEADER_HEIGHT]);
+                const WIDGETS_HEIGHT = this.comfyClass === "RizzLoadImage" ? 220 : 60; // Estimate space for widgets
+                const OFFSET = 30; // User requested 30px further down
+                this.setSize([img.width, img.height + HEADER_HEIGHT + WIDGETS_HEIGHT + OFFSET]);
                 this.setDirtyCanvas(true, true);
             }
         }
@@ -235,7 +237,7 @@ function setupImageNode(node) {
             // Fix: Force the widget to display as a standard combo (text only)
             // 1. Override computeSize to return standard small height
             imgWidget.computeSize = function (width) {
-                return [width, 22]; // Standard height for text widget
+                return [width, 30]; // Increased from 22 to 30 for visibility
             };
 
             // 2. Override draw to only draw the text/background

@@ -67,7 +67,7 @@ try:
             # Check for path aliases
             if path == "None":
                 import folder_paths
-                path = folder_paths.get_output_directory()
+                path = os.path.join(folder_paths.get_output_directory(), "RizzImage")
             elif path == "Custom":
                 # For custom, we rely on a second "custom_path" arg if we could, 
                 # but the request.json() "path" is what we get.
