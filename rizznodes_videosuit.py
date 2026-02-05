@@ -200,7 +200,7 @@ class RizzLoadVideo:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "folder_path": ("STRING", {"default": folder_paths.get_input_directory(), "multiline": False}),
+                "folder_path": ("STRING", {"default": "RizzVideo", "multiline": False}),
                 "file": (["None"], {"default": "None"}),
             }
         }
@@ -226,7 +226,15 @@ class RizzLoadVideo:
         if not file or file == "None" or not folder_path:
             raise ValueError("Please select a video file")
         
-        video_path = os.path.join(folder_path, file)
+        if not file or file == "None" or not folder_path:
+            raise ValueError("Please select a video file")
+        
+        # Helper to resolve "RizzVideo" to output/RizzVideo
+        if folder_path == "RizzVideo":
+            video_path = os.path.join(folder_paths.get_output_directory(), "RizzVideo", file)
+        else:
+            video_path = os.path.join(folder_path, file)
+            
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
         
@@ -247,7 +255,7 @@ class RizzLoadAudio:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "folder_path": ("STRING", {"default": folder_paths.get_input_directory(), "multiline": False}),
+                "folder_path": ("STRING", {"default": "RizzAudio", "multiline": False}),
                 "file": (["None"], {"default": "None"}), 
             },
         }
@@ -273,7 +281,14 @@ class RizzLoadAudio:
         if not file or file == "None" or not folder_path:
             return (None, 0.0)
         
-        path = os.path.join(folder_path, file)
+        if not file or file == "None" or not folder_path:
+            return (None, 0.0)
+        
+        # Helper to resolve "RizzAudio" to output/RizzAudio
+        if folder_path == "RizzAudio":
+            path = os.path.join(folder_paths.get_output_directory(), "RizzAudio", file)
+        else:
+            path = os.path.join(folder_path, file)
         if not os.path.exists(path):
             raise ValueError(f"File not found: {path}")
             
@@ -1010,6 +1025,7 @@ class RizzPreviewVideo:
                 "autoplay": ("BOOLEAN", {"default": True}),
                 "loop": ("BOOLEAN", {"default": False}),
                 "max_size": ("INT", {"default": 0, "min": 0, "max": 4096, "tooltip": "Max dimension (0 = original size)"}),
+                "pixel_perfect": ("BOOLEAN", {"default": False, "tooltip": "Use nearest-neighbor scaling for sharp edges (good for pixel art)."}),
             }
         }
     
@@ -1018,7 +1034,7 @@ class RizzPreviewVideo:
     OUTPUT_NODE = True
     CATEGORY = "RizzNodes/Video"
     
-    def preview(self, video, autoplay=True, loop=False, max_size=0):
+    def preview(self, video, autoplay=True, loop=False, max_size=0, pixel_perfect=False):
         import shutil
         import random
         
@@ -1034,9 +1050,10 @@ class RizzPreviewVideo:
         # If max_size is set, resize the video for preview
         if max_size > 0 and (video['width'] > max_size or video['height'] > max_size):
             # Scale down for preview
+            scale_flags = ":flags=neighbor" if pixel_perfect else ""
             cmd = [
                 'ffmpeg', '-y', '-i', input_path,
-                '-vf', f"scale='min({max_size},iw)':'min({max_size},ih)':force_original_aspect_ratio=decrease",
+                '-vf', f"scale='min({max_size},iw)':'min({max_size},ih)':force_original_aspect_ratio=decrease{scale_flags}",
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
                 '-c:a', 'aac', '-b:a', '128k',
                 preview_path

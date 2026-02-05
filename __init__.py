@@ -48,7 +48,18 @@ try:
             path = data.get("path")
             type_filter = data.get("type", "audio") # "audio" or "video"
             
-            if not path or not os.path.isdir(path):
+            if not path:
+                return web.json_response({"files": []})
+
+            # Check for path aliases
+            if path == "RizzVideo":
+                import folder_paths
+                path = os.path.join(folder_paths.get_output_directory(), "RizzVideo")
+            elif path == "RizzAudio":
+                import folder_paths
+                path = os.path.join(folder_paths.get_output_directory(), "RizzAudio")
+            
+            if not os.path.isdir(path):
                 return web.json_response({"files": []})
             
             files = []
