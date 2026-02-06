@@ -41,14 +41,17 @@ class RizzSaveImage:
 
     def save_images_main(self, images, model, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None, output_type="output"):
         filename_prefix = model
-        
+
         if output_type == "output":
             if model == "None":
                 output_dir = os.path.join(folder_paths.get_output_directory(), "RizzImage")
+                output_subfolder = "RizzImage"
             else:
                 output_dir = os.path.join(folder_paths.get_output_directory(), "RizzImage", model)
+                output_subfolder = os.path.join("RizzImage", model)
         else: # "temp"
             output_dir = folder_paths.get_temp_directory()
+            output_subfolder = ""
             filename_prefix = "RizzPreview" # For temp files
 
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, output_dir, images[0].shape[1], images[0].shape[0])
@@ -140,10 +143,19 @@ class RizzSaveImage:
                     "type": "temp"
                 })
             else:
+                # Resolve subfolder relative to output root (or temp dir if output_type is temp)
+                if output_type == "temp":
+                    result_subfolder = subfolder if subfolder else ""
+                else:
+                    if subfolder:
+                        result_subfolder = os.path.join(output_subfolder, subfolder)
+                    else:
+                        result_subfolder = output_subfolder
+
                 results.append({
                     "filename": file,
-                    "subfolder": "RizzImage" if model == "None" else os.path.join("RizzImage", model),
-                    "type": "output"
+                    "subfolder": result_subfolder,
+                    "type": "temp" if output_type == "temp" else "output"
                 })
             
             counter += 1
@@ -205,8 +217,8 @@ class RizzPreviewImage(RizzSaveImage):
     CATEGORY = "RizzNodes/Image"
 
     def save_images(self, images):
-        # Simple temp save for preview
-        return self.save_images_main(images, model="Preview", resize=False, width=0, height=0, format="png", quality=90, output_type="temp")
+        # Persistent preview save (matches Blender preview behavior)
+        return self.save_images_main(images, model="Preview", resize=False, width=0, height=0, format="png", quality=90, output_type="output")
 
     @classmethod
     def VALIDATE_INPUTS(cls, images):
@@ -220,7 +232,7 @@ class RizzLoadImage(RizzSaveImage):
             "required": {
                 "folder": (["None", "Flux", "flux2", "qwen", "qwenedit", "sd1.5", "sdxl", "sd3", "anime", "Custom"],),
                 "custom_path": ("STRING", {"default": "RizzImage"}),
-                "image": (["None"], {"image_upload": True}), # List instead of STRING for dropdown
+                "image": ([""], {"image_upload": True}), # List instead of STRING for dropdown
                 "resize": ("BOOLEAN", {"default": False}),
                 "width": ("INT", {"default": 512, "min": 0, "max": 16384}),
                 "height": ("INT", {"default": 512, "min": 0, "max": 16384}),
@@ -234,6 +246,34 @@ class RizzLoadImage(RizzSaveImage):
     RETURN_NAMES = ("IMAGE", "IMAGE/ALPHA")
     FUNCTION = "load_image"
     CATEGORY = "RizzNodes/Image"
+
+    @classmethod
+    def VALIDATE_INPUTS(s, image, folder=None, custom_path=None):
+        if image in (None, "", "None"):
+            return True
+
+        output_root = folder_paths.get_output_directory()
+
+        if folder == "None":
+            target_folder = os.path.join(output_root, "RizzImage")
+        elif folder == "Custom":
+            if custom_path and os.path.isabs(custom_path):
+                target_folder = custom_path
+            else:
+                target_folder = os.path.join(output_root, custom_path or "")
+        else:
+            target_folder = os.path.join(output_root, "RizzImage", folder or "")
+
+        candidates = [
+            os.path.join(target_folder, image),
+            os.path.join(folder_paths.get_input_directory(), image),
+            os.path.join(output_root, "RizzImage", image),
+        ]
+
+        if any(os.path.exists(p) for p in candidates):
+            return True
+
+        return f"Invalid image file: {image}"
 
     def load_image(self, folder, custom_path, image, resize, width, height, upscale_model=None):
         if image == "None" or not image:
@@ -371,16 +411,23 @@ class RizzLoadImage(RizzSaveImage):
              alpha = torch.ones_like(tensor_rgb[..., 0:1])
              tensor_rgba = torch.cat((tensor_rgb, alpha), dim=-1)
              
-        return (tensor_rgb, tensor_rgba), {
+        image_type = "output" if image_path.startswith(folder_paths.get_output_directory()) else "input"
+        if image_type == "output":
+            subfolder = os.path.dirname(os.path.relpath(image_path, folder_paths.get_output_directory()))
+        else:
+            subfolder = os.path.dirname(os.path.relpath(image_path, folder_paths.get_input_directory()))
+
+        return {
             "ui": {
                 "images": [
                     {
                         "filename": os.path.basename(image_path),
-                        "subfolder": os.path.dirname(os.path.relpath(image_path, folder_paths.get_output_directory())),
-                        "type": "output" if "output" in image_path else "input"
+                        "subfolder": subfolder,
+                        "type": image_type
                     }
                 ]
-            }
+            },
+            "result": (tensor_rgb, tensor_rgba)
         }
 
     @classmethod

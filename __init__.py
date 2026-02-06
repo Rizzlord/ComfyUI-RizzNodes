@@ -119,6 +119,60 @@ try:
             print(f"[RizzNodes] Error listing files: {e}")
             return web.json_response({"files": []})
 
+    @server.PromptServer.instance.routes.post("/rizz/ensure_input")
+    async def ensure_input(request):
+        try:
+            import shutil
+            import folder_paths
+            data = await request.json()
+            filename = data.get("filename")
+            folder = data.get("folder", "None")
+            custom_path = data.get("custom_path", "")
+            if not filename:
+                return web.json_response({"ok": False})
+
+            # Sanitize filename
+            filename = os.path.basename(filename)
+
+            input_dir = folder_paths.get_input_directory()
+            input_path = os.path.join(input_dir, filename)
+            if os.path.exists(input_path):
+                return web.json_response({"ok": True})
+
+            output_root = folder_paths.get_output_directory()
+            if folder == "None":
+                target_folder = os.path.join(output_root, "RizzImage")
+            elif folder == "Custom":
+                if custom_path and os.path.isabs(custom_path):
+                    target_folder = custom_path
+                else:
+                    target_folder = os.path.join(output_root, custom_path or "")
+            else:
+                target_folder = os.path.join(output_root, "RizzImage", folder)
+
+            candidates = [
+                os.path.join(target_folder, filename),
+                os.path.join(output_root, "RizzImage", filename),
+            ]
+
+            src_path = next((p for p in candidates if os.path.exists(p)), None)
+            if not src_path:
+                return web.json_response({"ok": False})
+
+            try:
+                os.makedirs(input_dir, exist_ok=True)
+                try:
+                    os.symlink(src_path, input_path)
+                except Exception:
+                    shutil.copy2(src_path, input_path)
+                return web.json_response({"ok": True})
+            except Exception as e:
+                print(f"[RizzNodes] ensure_input copy failed: {e}")
+                return web.json_response({"ok": False})
+        except Exception as e:
+            print(f"[RizzNodes] ensure_input error: {e}")
+            return web.json_response({"ok": False})
+
 except ImportError:
     print("[RizzNodes] Failed to import server for backend routes.")
 

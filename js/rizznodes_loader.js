@@ -33,12 +33,15 @@ app.registerExtension({
             const widget = node.widgets.find(w => w.name === "image");
             if (!widget) return;
 
-            const values = ["None", ...files];
+            const values = files && files.length ? files : [""];
             widget.options.values = values;
 
             if (!values.includes(widget.value)) {
-                widget.value = "None";
+                widget.value = files && files.length > 0 ? files[0] : "";
             }
+
+            node.setDirtyCanvas(true, true);
+            updatePreview();
         };
 
         const folderWidget = node.widgets.find(w => w.name === "folder");
@@ -99,9 +102,44 @@ app.registerExtension({
 
         // Preview Logic
         const imageWidget = node.widgets.find(w => w.name === "image");
+        if (imageWidget && imageWidget.value === "None") {
+            imageWidget.value = "";
+        }
+
+        const getWidgetBottom = () => {
+            if (!node.widgets) return 0;
+            return node.widgets.reduce((acc, w) => {
+                let h = 0;
+                if (w.computedHeight != null) h = w.computedHeight;
+                else if (w.height != null) h = w.height;
+                else if (w.computeSize) h = w.computeSize(node.size[0])[1];
+                else h = 20;
+                const y = w.y || 0;
+                return Math.max(acc, y + h);
+            }, 0);
+        };
+
+        const ensureInputCopy = async (filename) => {
+            if (!filename || filename === "None") return;
+            try {
+                await api.fetchApi("/rizz/ensure_input", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        filename: filename,
+                        folder: folderWidget?.value ?? "None",
+                        custom_path: customPathWidget?.value ?? "",
+                        type: type
+                    })
+                });
+            } catch (err) {
+                // Non-fatal; preview will still attempt output path
+                console.warn("[RizzNodes] ensure_input failed:", err);
+            }
+        };
 
         function updatePreview() {
-            if (!imageWidget || imageWidget.value === "None") {
+            if (!imageWidget || !imageWidget.value || imageWidget.value === "None") {
                 node.rizz_img = null;
                 return;
             }
@@ -121,31 +159,34 @@ app.registerExtension({
             // If they drag dropped, the value is just "filename.png" and it's in INPUT.
             // But we don't easily know WHICH 
             // Let's assume folder_path + filename in Output            
-            const api_url = `./view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(folder_path)}&type=output`;
+            const api_url = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(folder_path)}&type=output`);
 
             const img = new Image();
             img.onload = () => {
                 node.rizz_img = img;
                 // Auto-resize node to image dimensions
                 // Add some padding for widgets
-                const widgetHeight = node.widgets.reduce((acc, w) => acc + (w.computeSize ? w.computeSize()[1] : 20), 0) + 40;
-                node.setSize([img.width, img.height + widgetHeight]);
+                const widgetHeight = getWidgetBottom() + 20;
+                node.setSize([img.width, img.height + widgetHeight + 20]);
                 node.setDirtyCanvas(true, true);
             };
             img.onerror = () => {
                 // Try Input folder fallback (standard upload location)
-                const fallback_url = `./view?filename=${encodeURIComponent(filename)}&type=input`;
+                const fallback_url = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input`);
                 const img2 = new Image();
                 img2.onload = () => {
                     node.rizz_img = img2;
                     // Auto-resize node
-                    const widgetHeight = node.widgets.reduce((acc, w) => acc + (w.computeSize ? w.computeSize()[1] : 20), 0) + 40;
-                    node.setSize([img2.width, img2.height + widgetHeight]);
+                    const widgetHeight = getWidgetBottom() + 20;
+                    node.setSize([img2.width, img2.height + widgetHeight + 20]);
                     node.setDirtyCanvas(true, true);
                 };
                 img2.src = fallback_url;
             };
             img.src = api_url;
+
+            // Ensure ComfyUI input preview works for this file (optional)
+            ensureInputCopy(filename);
         }
 
         // Hook into onDrawForeground to render the image
@@ -157,7 +198,7 @@ app.registerExtension({
                 const img = this.rizz_img;
                 // Draw image to fill node or fit?
 
-                const widgetHeight = this.widgets.reduce((acc, w) => acc + (w.computeSize ? w.computeSize()[1] : 20), 0) + 20;
+                const widgetHeight = getWidgetBottom() + 20;
                 // Draw below widgets
 
                 const ratio = img.width / img.height;
@@ -173,14 +214,44 @@ app.registerExtension({
             }
         };
 
+        // Hide the widget's built-in image preview to avoid double rendering
+        if (imageWidget) {
+            imageWidget.computeSize = function (width) {
+                return [width, 30];
+            };
+
+            const originalDraw = imageWidget.draw;
+            if (typeof originalDraw === "function") {
+                imageWidget.draw = function (ctx, node, widgetWidth, y, widgetHeight) {
+                    const savedImage = this.image;
+                    this.image = null;
+                    try {
+                        originalDraw.apply(this, arguments);
+                    } finally {
+                        this.image = savedImage;
+                    }
+                };
+            }
+        }
+
         // Update preview on changes
         if (imageWidget) {
             const origCallback = imageWidget.callback;
             imageWidget.callback = (v) => {
+                ensureInputCopy(imageWidget.value);
                 updatePreview();
                 if (origCallback) origCallback.apply(this, arguments);
             };
         }
+
+        const onConfigure = node.onConfigure;
+        node.onConfigure = function () {
+            if (onConfigure) onConfigure.apply(this, arguments);
+            if (imageWidget && imageWidget.value === "None") {
+                imageWidget.value = "";
+            }
+            updateFiles();
+        };
 
         // Also update on refresh files
         const origUpdate = updateFiles;
