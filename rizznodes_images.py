@@ -15,15 +15,15 @@ class RizzSaveImage:
             "required": {
                 "images": ("IMAGE",),
                 "model": (["None", "Flux", "flux2", "qwen", "qwenedit", "sd1.5", "sdxl", "sd3", "anime"],),
-                "resize": ("BOOLEAN", {"default": False}),
-                "width": ("INT", {"default": 512, "min": 0, "max": 16384}),
-                "height": ("INT", {"default": 512, "min": 0, "max": 16384}),
-                "format": (["png", "webp", "jpg", "tga", "bmp"],),
-                "quality": ("INT", {"default": 90, "min": 1, "max": 100}),
-                "save_metadata": ("BOOLEAN", {"default": True}),
+                "resize": ("BOOLEAN", {"default": False, "tooltip": "Resize the image to the specified width and height."}),
+                "width": ("INT", {"default": 512, "min": 0, "max": 16384, "tooltip": "Target width for resizing."}),
+                "height": ("INT", {"default": 512, "min": 0, "max": 16384, "tooltip": "Target height for resizing."}),
+                "format": (["png", "webp", "jpg", "tga", "bmp"], {"tooltip": "Image format to save as."}),
+                "quality": ("INT", {"default": 90, "min": 1, "max": 100, "tooltip": "Compression quality for WebP and JPG."}),
+                "save_metadata": ("BOOLEAN", {"default": True, "tooltip": "Save generation metadata (prompt, workflow) in the image file. Supported formats: PNG, WebP, JPEG."}),
             },
             "optional": {
-                "upscale_model": ("UPSCALE_MODEL",),
+                "upscale_model": ("UPSCALE_MODEL", {"tooltip": "Optional upscale model to apply before resizing."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -59,13 +59,6 @@ class RizzSaveImage:
             # Process image (Resize / Upscale)
             if upscale_model is not None:
                 image = self.upscale(image, upscale_model)
-                # If resize is ALSO checked, maybe we should resize AFTER upscale?
-                # User logic: "resize with lanczos or upscale model".
-                # Implies one or the other. But if upscale is connected, it probably takes precedence for "upscaling".
-                # If user connects upscale model AND sets resize=True with specific W/H, 
-                # strictly speaking we should probably downscale/resize to that target after upscaling?
-                # For now, let's assume upscale model handles the resolution increase.
-                # If the user WANTS to force a size, they can check resize.
                 if resize:
                     image = self.resize_image(image, width, height)
             elif resize:
@@ -88,9 +81,6 @@ class RizzSaveImage:
                 else:
                     # For WebP, JPG, etc. try to save in Exif
                     try:
-                        import piexif
-                        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-                        
                         info = {}
                         if prompt is not None:
                             info["prompt"] = prompt
@@ -99,14 +89,18 @@ class RizzSaveImage:
                                 info[x] = extra_pnginfo[x]
                         
                         if info:
-                            # UserComment tag ID is 37510
-                            user_comment = json.dumps(info)
-                            exif_dict["Exif"][37510] = user_comment.encode("utf-8")
-                            exif_bytes = piexif.dump(exif_dict)
+                            exif = img.getexif()
+                            json_str = json.dumps(info)
+                            # UserComment (37510) with UNICODE header
+                            # header is b"UNICODE\0\0\0" followed by utf-16le encoded string
+                            payload = b"UNICODE\0\0\0" + json_str.encode("utf-16le")
+                            exif[0x9286] = payload
                             
-                    except ImportError:
-                        # Fallback if piexif not installed
-                        pass
+                            # Also ImageDescription (270) as utf-8 fallback
+                            exif[0x010e] = json_str.encode("utf-8")
+                            
+                            exif_bytes = exif.tobytes()
+                            
                     except Exception as e:
                         print(f"Failed to create EXIF data: {e}")
 
@@ -125,11 +119,33 @@ class RizzSaveImage:
             elif format == "bmp":
                  img.save(save_path)
             
-            results.append({
-                "filename": file,
-                "subfolder": "RizzImage" if model == "None" else os.path.join("RizzImage", model),
-                "type": "output"
-            })
+            # For TGA, create a PNG preview in temp because browsers can't display TGA and we need Alpha support (JPG has no alpha)
+            if format == "tga":
+                # Create temp preview
+                # We need a unique filename for the preview to avoid conflicts if multiple TGAs are saved
+                # Use same counter/prefix but in temp dir
+                preview_filename = f"RizzPreview_TGA_{filename}_{counter:05}_.png"
+                preview_dir = folder_paths.get_temp_directory()
+                preview_path = os.path.join(preview_dir, preview_filename)
+                
+                # Save PNG preview (no metadata needed for preview)
+                img.save(preview_path, optimize=True)
+                
+                results.append({
+                    "filename": preview_filename,
+                    "subfolder": "", # Empty subfolder implies root of temp dir when type is temp? Or None?
+                    # folder_paths.get_save_image_path behavior for temp is a bit specific.
+                    # Usually "subfolder" is relative to the base output/temp dir.
+                    # If we saved directly to get_temp_directory(), subfolder is empty.
+                    "type": "temp"
+                })
+            else:
+                results.append({
+                    "filename": file,
+                    "subfolder": "RizzImage" if model == "None" else os.path.join("RizzImage", model),
+                    "type": "output"
+                })
+            
             counter += 1
 
         return { "ui": { "images": results } }
@@ -383,3 +399,319 @@ args_disable_metadata = False
 # Define globally for all classes in this module
 def get_args_disable_metadata():
     return args_disable_metadata
+
+# ============================================================================
+# Blend Mode Functions (PyTorch)
+# ============================================================================
+
+def blend_normal(base, overlay, opacity):
+    return base * (1 - opacity) + overlay * opacity
+
+def blend_multiply(base, overlay, opacity):
+    result = base * overlay
+    return base * (1 - opacity) + result * opacity
+
+def blend_screen(base, overlay, opacity):
+    result = 1 - (1 - base) * (1 - overlay)
+    return base * (1 - opacity) + result * opacity
+
+def blend_overlay(base, overlay, opacity):
+    mask = (base < 0.5).float()
+    result = 2 * base * overlay * mask + (1 - 2 * (1 - base) * (1 - overlay)) * (1 - mask)
+    return base * (1 - opacity) + result * opacity
+
+def blend_soft_light(base, overlay, opacity):
+    # result = (1 - 2*overlay)*base*base + 2*base*overlay (simplified approx often used)
+    # OR standard Photoshop formula:
+    # if overlay < 0.5: base - (1 - 2 * overlay) * base * (1 - base)
+    # else: base + (2 * overlay - 1) * (sqrt(base) - base)
+    
+    mask = (overlay < 0.5).float()
+    term1 = base - (1 - 2 * overlay) * base * (1 - base)
+    term2 = base + (2 * overlay - 1) * (torch.sqrt(base + 1e-6) - base)
+    result = term1 * mask + term2 * (1 - mask)
+    return base * (1 - opacity) + result * opacity
+
+def blend_hard_light(base, overlay, opacity):
+    # Swap base and overlay in Overlay formula
+    # if overlay < 0.5: 2 * base * overlay
+    # else: 1 - 2 * (1 - base) * (1 - overlay)
+    mask = (overlay < 0.5).float()
+    result = 2 * base * overlay * mask + (1 - 2 * (1 - base) * (1 - overlay)) * (1 - mask)
+    return base * (1 - opacity) + result * opacity
+
+def blend_color_dodge(base, overlay, opacity):
+    # base / (1 - overlay)
+    result = base / (1 - overlay + 1e-6)
+    result = torch.clamp(result, 0, 1)
+    return base * (1 - opacity) + result * opacity
+
+def blend_color_burn(base, overlay, opacity):
+    # 1 - (1 - base) / overlay
+    result = 1 - (1 - base) / (overlay + 1e-6)
+    result = torch.clamp(result, 0, 1)
+    return base * (1 - opacity) + result * opacity
+
+def blend_darken(base, overlay, opacity):
+    result = torch.min(base, overlay)
+    return base * (1 - opacity) + result * opacity
+
+def blend_lighten(base, overlay, opacity):
+    result = torch.max(base, overlay)
+    return base * (1 - opacity) + result * opacity
+
+# Helper for dispatch
+BLEND_MODES_FUNC = {
+    'Normal': blend_normal,
+    'Multiply': blend_multiply,
+    'Screen': blend_screen,
+    'Overlay': blend_overlay,
+    'Soft Light': blend_soft_light,
+    'Hard Light': blend_hard_light,
+    'Color Dodge': blend_color_dodge,
+    'Color Burn': blend_color_burn,
+    'Darken': blend_darken,
+    'Lighten': blend_lighten,
+}
+
+MAX_IMAGE_SLOTS = 5
+
+class RizzImageEffects:
+    @classmethod
+    def INPUT_TYPES(s):
+        inputs = {
+            "required": {
+                "base_image": ("IMAGE",),
+                "image_count": ("INT", {
+                    "default": 0, "min": 0, "max": MAX_IMAGE_SLOTS, "step": 1,
+                    "tooltip": "Number of image overlays (0-5). Each gets its own blend mode, opacity, and position."
+                }),
+            },
+            "optional": {}
+        }
+        
+        blend_modes = list(BLEND_MODES_FUNC.keys())
+        position_modes = ["Stretched", "Tiled", "Center", "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"]
+        
+        # Generate dynamic inputs
+        for i in range(1, MAX_IMAGE_SLOTS + 1):
+            inputs["optional"][f"image_{i}"] = ("IMAGE",)
+            inputs["optional"][f"image_{i}_blend"] = (blend_modes, {
+                "default": "Normal",
+                "tooltip": f"Blend mode for image {i}."
+            })
+            inputs["optional"][f"image_{i}_opacity"] = ("FLOAT", {
+                "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": f"Opacity for image {i}. 0 = transparent, 1 = fully visible."
+            })
+            inputs["optional"][f"image_{i}_position"] = (position_modes, {
+                "default": "Stretched",
+                "tooltip": f"Position/sizing mode for image {i}."
+            })
+            inputs["optional"][f"image_{i}_tile_scale"] = ("FLOAT", {
+                "default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1,
+                "tooltip": f"Scale factor for tiled image {i}. Smaller = more tiles."
+            })
+            
+        return inputs
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "apply_effects"
+    CATEGORY = "RizzNodes/Image"
+
+    def apply_effects(self, base_image, image_count=0, **kwargs):
+        # Base image: [B, H, W, C]
+        temp_image = base_image.clone()
+        
+        batch_size, h, w, c = temp_image.shape
+        
+        # We process each overlay
+        for i in range(1, min(image_count, MAX_IMAGE_SLOTS) + 1):
+            overlay_img = kwargs.get(f"image_{i}")
+            if overlay_img is None:
+                continue
+                
+            blend_mode_name = kwargs.get(f"image_{i}_blend", "Normal")
+            opacity = kwargs.get(f"image_{i}_opacity", 1.0)
+            position = kwargs.get(f"image_{i}_position", "Stretched")
+            tile_scale = kwargs.get(f"image_{i}_tile_scale", 1.0)
+            
+            # Prepare overlay
+            # overlay_img is [B_o, H_o, W_o, C_o]
+            # If B_o != B, we might need to handle broadcasting or just use first frame?
+            # Comfy usually broadcasts if one is 1. If both > 1 and mismatch, error or clip?
+            # We'll rely on simple iter logic or broadcasting.
+            
+            # 1. Resize/Transform overlay to match base (h, w)
+            
+            # Helper to resize tensor [B, H, W, C] -> [B, h, w, C]
+            def resize_to(img_tensor, new_h, new_w):
+                # Permute to [B, C, H, W] for grid_sample/interpolate
+                img_p = img_tensor.permute(0, 3, 1, 2)
+                img_r = torch.nn.functional.interpolate(img_p, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                return img_r.permute(0, 2, 3, 1) # Back to [B, H, W, C]
+            
+            processed_overlay = None
+            
+            ov_h, ov_w = overlay_img.shape[1], overlay_img.shape[2]
+            
+            if position == "Stretched":
+                processed_overlay = resize_to(overlay_img, h, w)
+                
+            elif position == "Tiled":
+                # Calculate new size based on scale
+                # scale 1.0 means original size? User tooltip says "Smaller = more tiles".
+                # But logic says "Scale factor for tiled image".
+                # If scale=1.0, utilize original dimensions?
+                # Let's interpret scale as: target_size = original_size * scale
+                
+                target_h = max(1, int(ov_h * tile_scale))
+                target_w = max(1, int(ov_w * tile_scale))
+                
+                # Resize overlay to target size
+                resized_ov = resize_to(overlay_img, target_h, target_w)
+                
+                # Tile it to fill (h, w)
+                # repeat counts
+                import math
+                rep_y = math.ceil(h / target_h)
+                rep_x = math.ceil(w / target_w)
+                
+                # Repeat
+                tiled = resized_ov.repeat(1, rep_y, rep_x, 1)
+                
+                # Crop to exact fit
+                processed_overlay = tiled[:, :h, :w, :]
+                
+            else: # Center, Corners
+                # Keep aspect ratio / original size, but place it
+                # We need a canvas of size (h, w) separate for the overlay?
+                # Or we can use padding logic.
+                
+                # First, ensure we don't resize the overlay unless we want to?
+                # "Position/sizing mode" implies moving it.
+                # Video node: scale='min(W,iw)':'min(H,ih)' -> fit inside but keep aspect?
+                # Or just keep original size if smaller?
+                # Let's keep original size (clipped if larger).
+                
+                # Create empty canvas (transparent black)
+                # If overlay has alpha... our tensors are usually RGB (3 channels) or RGBA (4).
+                # Comfy generally uses RGB images unless loaded with mask.
+                # If overlay_img has 3 channels, we assume opaque?
+                # If we put a small image on top, the rest is transparent (for blending).
+                
+                # We need an alpha channel for the overlay layer to composite correctly over base.
+                
+                # Case 1: result buffer [B, H, W, C]. Initialize with zeros (transparent).
+                # But wait, blend modes work on pixels.
+                # If we have "Center", we want the overlay pixels in center, and 0 contribution elsewhere?
+                # Yes, effectively opacity 0 elsewhere.
+                
+                # Let's construct a full-size overlay layer [B, H, W, C]
+                # Filled with... what?
+                # For "Normal" blend, transparent pixels don't affect base.
+                # For "Multiply", transparent pixels should be... 1.0 (white)?
+                # Comfy blend nodes usually use masks.
+                # Here we are simulating layers.
+                
+                # We need a mask channel for the overlay.
+                if overlay_img.shape[-1] == 4:
+                    ov_rgb = overlay_img[..., :3]
+                    ov_a = overlay_img[..., 3:4]
+                else:
+                    ov_rgb = overlay_img
+                    ov_a = torch.ones((overlay_img.shape[0], ov_h, ov_w, 1), device=overlay_img.device)
+                
+                # Create output buffers
+                canvas_rgb = torch.zeros((batch_size, h, w, 3), device=temp_image.device)
+                canvas_a = torch.zeros((batch_size, h, w, 1), device=temp_image.device)
+                
+                # Calculate positions
+                pad_top, pad_left = 0, 0
+                
+                eff_h = min(h, ov_h)
+                eff_w = min(w, ov_w)
+                
+                if position == "Center":
+                    pad_top = (h - eff_h) // 2
+                    pad_left = (w - eff_w) // 2
+                elif position == "Top-Left":
+                    pad_top = 0
+                    pad_left = 0
+                elif position == "Top-Right":
+                    pad_top = 0
+                    pad_left = w - eff_w
+                elif position == "Bottom-Left":
+                    pad_top = h - eff_h
+                    pad_left = 0
+                elif position == "Bottom-Right":
+                    pad_top = h - eff_h
+                    pad_left = w - eff_w
+                
+                # Place overlay on canvas
+                # We take the crop of overlay that fits
+                # Src slice: 0 to eff_h, 0 to eff_w
+                # Dst slice: pad_top to pad_top+eff_h, ...
+                
+                # Handle batch mismatch simply by repeating if needed or modulo
+                for b in range(batch_size):
+                    ov_idx = b % overlay_img.shape[0]
+                    canvas_rgb[b, pad_top:pad_top+eff_h, pad_left:pad_left+eff_w, :] = ov_rgb[ov_idx, :eff_h, :eff_w, :]
+                    canvas_a[b, pad_top:pad_top+eff_h, pad_left:pad_left+eff_w, :] = ov_a[ov_idx, :eff_h, :eff_w, :]
+                
+                processed_overlay = torch.cat((canvas_rgb, canvas_a), dim=-1)
+
+            # Ensure broadcasting if batch sizes differ for Stretched/Tiled cases
+            if processed_overlay.shape[0] != batch_size:
+                 # Simple repeat if 1 -> N
+                 if processed_overlay.shape[0] == 1:
+                     processed_overlay = processed_overlay.repeat(batch_size, 1, 1, 1)
+                 else:
+                     # If mismatch otherwise, maybe slice?
+                     # Just force match
+                     pass
+            
+            # Perform Blend
+            # Base is RGB or RGBA?
+            if temp_image.shape[-1] == 4:
+                base_rgb = temp_image[..., :3]
+            else:
+                base_rgb = temp_image
+                
+            if processed_overlay.shape[-1] == 4:
+                ov_rgb = processed_overlay[..., :3]
+                ov_a = processed_overlay[..., 3:4] # Mask from positioning/alpha
+            else:
+                ov_rgb = processed_overlay
+                ov_a = torch.ones((batch_size, h, w, 1), device=temp_image.device)
+            
+            # 1. Apply opacity to the overlay alpha
+            final_ov_a = ov_a * opacity
+            
+            # 2. Blend
+            # Standard composition: Result = Blend(Base, Overlay) * OvAlpha + Base * (1 - OvAlpha)
+            # The blend function gives the color where overlay exists.
+            
+            func = BLEND_MODES_FUNC.get(blend_mode_name, blend_normal)
+            blended_rgb = func(base_rgb, ov_rgb, 0) # Opacity handled by alpha mix below
+             # Passing 0 as opacity to the blend func because we use alpha compositing for the final mix.
+             # Wait, standard blend functions usually output the "blended result".
+             # Opacity param in my functions is `base * (1-op) + res * op`.
+             # If I pass 0, I get `base`. That's wrong. I want `res`.
+             # If I pass 1, I get `res`.
+             # So blend_rgb = func(base, overlay, 1.0)
+            
+            blended_rgb = func(base_rgb, ov_rgb, 1.0)
+            
+            # Compose
+            final_rgb = blended_rgb * final_ov_a + base_rgb * (1 - final_ov_a)
+            
+            # Update base image
+            if temp_image.shape[-1] == 4:
+                # Update alpha? Usually keep base alpha or union? 
+                # Let's say we keep base alpha logic or just 1.0 if not.
+                temp_image = torch.cat((final_rgb, temp_image[..., 3:4]), dim=-1)
+            else:
+                temp_image = final_rgb
+
+        return (temp_image,)

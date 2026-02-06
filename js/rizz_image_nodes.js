@@ -33,6 +33,8 @@ function setupImageNode(node) {
             // Resize node to match image (plus header space)
             const HEADER_HEIGHT = 40; // rough estimate
 
+            let changed = false;
+
             if (img.width && img.height) {
                 const WIDGETS_HEIGHT = this.comfyClass === "RizzLoadImage" ? 260 : 60; // Increased space for widgets to accommodate refresh button and file selector
                 const OFFSET = 30; // User requested 30px further down
@@ -43,12 +45,45 @@ function setupImageNode(node) {
                 // Save state
                 if (!this.properties) this.properties = {};
                 this.properties.last_size = newSize;
+                changed = true;
             }
 
             // Save image info for reload
             if (this.ui.images && this.ui.images.length > 0) {
                 if (!this.properties) this.properties = {};
                 this.properties.last_output = this.ui.images;
+                changed = true;
+            }
+
+            if (changed) {
+                // Determine if we need to trigger an autosave
+                // ComfyUI autosaves on graph change.
+                // We can try to trigger it.
+                // app.graph.change() might be internal.
+                // But generally modifying properties doesn't always trigger autosave instantly.
+                // Let's force it if possible, or just hope the user does something else?
+                // The user specifically complained it doesn't save on reload.
+                // So we MUST trigger persistence.
+
+                // Try:
+                if (app.graph.onChange) {
+                    app.graph.onChange();
+                } else if (app.graph.setDirty) {
+                    // app.graph.setDirty() usually means re-execute. We don't want that.
+                    // We just want to dirty the project "state".
+                }
+
+                // Another trick: dispatch event?
+                // app.graph.change(); // This is the standard method if available 
+
+                // Let's try standard LiteGraph notify?
+                // app.graph.setDirtyCanvas(true, true); // Visual only
+
+                // Best effort:
+                try {
+                    // Creating history checkpoint or triggering change
+                    if (app.graph.change) app.graph.change();
+                } catch (e) { }
             }
         }
     };

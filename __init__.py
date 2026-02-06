@@ -13,7 +13,7 @@ from .rizznodes_audioops import (
     NODE_DISPLAY_NAME_MAPPINGS as AUDIO_NODE_DISPLAY_NAME_MAPPINGS
 )
 from .rizznodes_images import (
-    RizzSaveImage, RizzPreviewImage, RizzLoadImage
+    RizzSaveImage, RizzPreviewImage, RizzLoadImage, RizzImageEffects
 )
 
 NODE_CLASS_MAPPINGS["RizzGDSPatcher"] = RizzGDSPatcher
@@ -45,6 +45,9 @@ NODE_DISPLAY_NAME_MAPPINGS["RizzPreviewImage"] = "Preview Image (Rizz)"
 
 NODE_CLASS_MAPPINGS["RizzLoadImage"] = RizzLoadImage
 NODE_DISPLAY_NAME_MAPPINGS["RizzLoadImage"] = "Load Image (Rizz)"
+
+NODE_CLASS_MAPPINGS["RizzImageEffects"] = RizzImageEffects
+NODE_DISPLAY_NAME_MAPPINGS["RizzImageEffects"] = "Image Effects (Rizz)"
 
 # Tell ComfyUI where to find our JavaScript files
 WEB_DIRECTORY = "js"
