@@ -217,8 +217,7 @@ class RizzPreviewImage(RizzSaveImage):
     CATEGORY = "RizzNodes/Image"
 
     def save_images(self, images):
-        # Persistent preview save (matches Blender preview behavior)
-        return self.save_images_main(images, model="Preview", resize=False, width=0, height=0, format="png", quality=90, output_type="output")
+        return self.save_images_main(images, model="Preview", resize=False, width=0, height=0, format="png", quality=90, output_type="temp")
 
     @classmethod
     def VALIDATE_INPUTS(cls, images):
@@ -232,7 +231,7 @@ class RizzLoadImage(RizzSaveImage):
             "required": {
                 "folder": (["None", "Flux", "flux2", "qwen", "qwenedit", "sd1.5", "sdxl", "sd3", "anime", "Custom"],),
                 "custom_path": ("STRING", {"default": "RizzImage"}),
-                "image": ([""], {"image_upload": True}), # List instead of STRING for dropdown
+                "image": ([""],),
                 "resize": ("BOOLEAN", {"default": False}),
                 "width": ("INT", {"default": 512, "min": 0, "max": 16384}),
                 "height": ("INT", {"default": 512, "min": 0, "max": 16384}),
@@ -432,15 +431,31 @@ class RizzLoadImage(RizzSaveImage):
 
     @classmethod
     def IS_CHANGED(s, folder, custom_path, image, resize, width, height, upscale_model=None):
-        import hashlib
-        m = hashlib.sha256()
-        m.update(folder.encode())
-        m.update(custom_path.encode())
-        m.update(image.encode())
-        return m.digest().hex()
+        if not image or image == "None":
+            return float('nan')
+        # Resolve the image path and use modification time for cache invalidation
+        output_root = folder_paths.get_output_directory()
+        if folder == "None":
+            target_folder = os.path.join(output_root, "RizzImage")
+        elif folder == "Custom":
+            if custom_path and os.path.isabs(custom_path):
+                target_folder = custom_path
+            else:
+                target_folder = os.path.join(output_root, custom_path or "")
+        else:
+            target_folder = os.path.join(output_root, "RizzImage", folder or "")
+        
+        candidates = [
+            os.path.join(target_folder, image),
+            os.path.join(folder_paths.get_input_directory(), image),
+            os.path.join(output_root, "RizzImage", image),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return os.path.getmtime(p)
+        return float('nan')
 
 # Shim for args
-import hashlib
 args_disable_metadata = False
 
 # Define globally for all classes in this module

@@ -38,16 +38,16 @@ NODE_DISPLAY_NAME_MAPPINGS.update(AUDIO_NODE_DISPLAY_NAME_MAPPINGS)
 
 # Register Image nodes
 NODE_CLASS_MAPPINGS["RizzSaveImage"] = RizzSaveImage
-NODE_DISPLAY_NAME_MAPPINGS["RizzSaveImage"] = "Save Image (Rizz)"
+NODE_DISPLAY_NAME_MAPPINGS["RizzSaveImage"] = "💾 Save Image (Rizz)"
 
 NODE_CLASS_MAPPINGS["RizzPreviewImage"] = RizzPreviewImage
-NODE_DISPLAY_NAME_MAPPINGS["RizzPreviewImage"] = "Preview Image (Rizz)"
+NODE_DISPLAY_NAME_MAPPINGS["RizzPreviewImage"] = "👁️ Preview Image (Rizz)"
 
 NODE_CLASS_MAPPINGS["RizzLoadImage"] = RizzLoadImage
-NODE_DISPLAY_NAME_MAPPINGS["RizzLoadImage"] = "Load Image (Rizz)"
+NODE_DISPLAY_NAME_MAPPINGS["RizzLoadImage"] = "📂 Load Image (Rizz)"
 
 NODE_CLASS_MAPPINGS["RizzImageEffects"] = RizzImageEffects
-NODE_DISPLAY_NAME_MAPPINGS["RizzImageEffects"] = "Image Effects (Rizz)"
+NODE_DISPLAY_NAME_MAPPINGS["RizzImageEffects"] = "🎨 Image Effects (Rizz)"
 
 # Tell ComfyUI where to find our JavaScript files
 WEB_DIRECTORY = "js"
@@ -56,6 +56,47 @@ try:
     import server
     from aiohttp import web
     import os
+
+    _EASY_REQUIRED_INPUT_DEFAULTS = {
+        # Use scalar defaults (not None) because easy-use's Any type compares equal
+        # to core scalar types during validation, which can trigger conversions.
+        "easy cleanGpuUsed": {"anything": 0},
+        "easy clearCacheAll": {"anything": 0},
+        "easy clearCacheKey": {"anything": 0, "cache_key": "*"},
+    }
+
+    def _patch_easy_use_missing_inputs(json_data):
+        prompt = json_data.get("prompt")
+        if not isinstance(prompt, dict):
+            return json_data
+
+        patched_inputs = 0
+        for node_data in prompt.values():
+            if not isinstance(node_data, dict):
+                continue
+
+            defaults = _EASY_REQUIRED_INPUT_DEFAULTS.get(node_data.get("class_type"))
+            if not defaults:
+                continue
+
+            inputs = node_data.get("inputs")
+            if not isinstance(inputs, dict):
+                inputs = {}
+                node_data["inputs"] = inputs
+
+            for key, default_value in defaults.items():
+                if key not in inputs:
+                    inputs[key] = default_value
+                    patched_inputs += 1
+
+        if patched_inputs:
+            print(f"[RizzNodes] Patched {patched_inputs} missing easy-use input(s).")
+
+        return json_data
+
+    if not getattr(server.PromptServer.instance, "_rizz_easy_input_patch", False):
+        server.PromptServer.instance.add_on_prompt_handler(_patch_easy_use_missing_inputs)
+        server.PromptServer.instance._rizz_easy_input_patch = True
 
     @server.PromptServer.instance.routes.post("/rizz/list_files")
     async def list_files(request):
