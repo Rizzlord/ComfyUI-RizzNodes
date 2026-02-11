@@ -37,6 +37,7 @@ app.registerExtension({
                 container.style.background = "rgba(10, 10, 10, 0.4)";
                 container.style.borderRadius = "12px";
                 container.style.display = "flex";
+                container.style.flexDirection = "column";
                 container.style.alignItems = "center";
                 container.style.justifyContent = "center";
                 container.style.marginTop = "-3px";
@@ -50,7 +51,23 @@ app.registerExtension({
                 this.videoElement.style.borderRadius = "8px";
                 this.videoElement.playsInline = true;
 
+                this.resolutionLabel = document.createElement("div");
+                this.resolutionLabel.style.color = "rgba(255, 255, 255, 0.6)";
+                this.resolutionLabel.style.fontSize = "11px";
+                this.resolutionLabel.style.fontFamily = "monospace";
+                this.resolutionLabel.style.marginTop = "4px";
+                this.resolutionLabel.style.textAlign = "center";
+                this.resolutionLabel.textContent = "";
+
+                const resLabel = this.resolutionLabel;
+                this.videoElement.addEventListener("loadedmetadata", function () {
+                    const w = this.videoWidth;
+                    const h = this.videoHeight;
+                    resLabel.textContent = (w && h) ? `${w} × ${h}` : "";
+                });
+
                 container.appendChild(this.videoElement);
+                container.appendChild(this.resolutionLabel);
                 this.addDOMWidget("rizz_video_preview", "video", container);
 
                 if (this.size[1] < 220) {
@@ -61,6 +78,7 @@ app.registerExtension({
             const autoplay = !!videoParams.autoplay;
             const loop = !!videoParams.loop;
 
+            this.resolutionLabel.textContent = "";
             this.videoElement.src = url;
             this.videoElement.loop = loop;
             this.videoElement.autoplay = autoplay;
