@@ -213,7 +213,10 @@ class RizzLoadVideo:
     @classmethod
     def IS_CHANGED(cls, folder_path="", file=""):
         if folder_path and file and file != "None":
-            path = os.path.join(folder_path, file)
+            if folder_path == "RizzVideo":
+                path = os.path.join(folder_paths.get_output_directory(), "RizzVideo", file)
+            else:
+                path = os.path.join(folder_path, file)
             if os.path.exists(path):
                 return os.path.getmtime(path)
         return float("nan")
@@ -223,9 +226,6 @@ class RizzLoadVideo:
         return True
     
     def load_video(self, folder_path, file):
-        if not file or file == "None" or not folder_path:
-            raise ValueError("Please select a video file")
-        
         if not file or file == "None" or not folder_path:
             raise ValueError("Please select a video file")
         
@@ -272,15 +272,15 @@ class RizzLoadAudio:
     @classmethod
     def IS_CHANGED(cls, folder_path="", file=""):
         if folder_path and file and file != "None":
-            path = os.path.join(folder_path, file)
+            if folder_path == "RizzAudio":
+                path = os.path.join(folder_paths.get_output_directory(), "RizzAudio", file)
+            else:
+                path = os.path.join(folder_path, file)
             if os.path.exists(path):
                 return os.path.getmtime(path)
         return float("nan")
 
     def load_audio(self, folder_path, file):
-        if not file or file == "None" or not folder_path:
-            return (None, 0.0)
-        
         if not file or file == "None" or not folder_path:
             return (None, 0.0)
         

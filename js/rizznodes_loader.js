@@ -409,6 +409,28 @@ app.registerExtension({
                 imageWidget.__rizz_preview_draw_bound = true;
             }
 
+            // Intercept value changes via property descriptor so preview updates
+            // whenever the selected image changes — works across all ComfyUI
+            // frontend versions (modern UI 2.0 may not fire widget.callback).
+            if (!imageWidget.__rizz_value_intercepted) {
+                let _currentValue = imageWidget.value;
+                Object.defineProperty(imageWidget, "value", {
+                    get() { return _currentValue; },
+                    set(v) {
+                        const changed = _currentValue !== v;
+                        _currentValue = v;
+                        if (changed && typeof v === "string" && v.length > 0) {
+                            node.imgs = null;
+                            ensureInputCopy(v);
+                            updatePreview(v, false);
+                        }
+                    },
+                    configurable: true,
+                    enumerable: true,
+                });
+                imageWidget.__rizz_value_intercepted = true;
+            }
+
             if (!imageWidget.__rizz_preview_callback_bound) {
                 const origCallback = imageWidget.callback;
                 imageWidget.callback = function (v) {
@@ -417,10 +439,6 @@ app.registerExtension({
                     if (currentImageWidget && typeof v === "string" && v.length > 0) {
                         currentImageWidget.value = v;
                     }
-                    const selected = currentImageWidget?.value;
-                    node.imgs = null;
-                    ensureInputCopy(selected);
-                    updatePreview(selected, false);
                 };
                 imageWidget.__rizz_preview_callback_bound = true;
             }
