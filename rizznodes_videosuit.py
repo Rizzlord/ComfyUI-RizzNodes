@@ -916,10 +916,10 @@ class RizzSaveVideo:
             },
             "optional": {
                 "codec": (["libx264", "libx265", "mpeg4", "libvpx-vp9"], {"default": "libx264", "tooltip": "Video codec. libx264 (H.264) is most compatible. libx265 (H.265/HEVC) has better compression. libvpx-vp9 for WebM format."}),
-                "quality_crf": ("INT", {"default": 23, "min": 0, "max": 51, "tooltip": "Constant Rate Factor: 0 = lossless, 23 = default, 51 = worst quality. Lower = better quality, larger file."}),
-                "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"], {"default": "medium", "tooltip": "Encoding speed preset. Slower = better compression but longer encoding time."}),
+                "quality_crf": ("INT", {"default": 23, "min": 0, "max": 51, "tooltip": "Quality control: CRF for x264/x265/VP9, mapped to qscale for MPEG-4. Lower = better quality, larger file."}),
+                "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"], {"default": "medium", "tooltip": "Encoding speed preset for x264/x265. Slower = better compression but longer encoding time."}),
                 "pixel_format": (["yuv420p", "yuv444p"], {"default": "yuv420p", "tooltip": "yuv420p is widely compatible. yuv444p preserves more color detail but less compatible."}),
-                "audio_codec": (["aac", "mp3"], {"default": "aac", "tooltip": "Audio codec. AAC is most compatible with MP4."}),
+                "audio_codec": (["aac", "mp3"], {"default": "aac", "tooltip": "Audio codec for MP4 outputs. VP9/WebM always uses Opus for compatibility."}),
                 "audio_bitrate": (["64k", "96k", "128k", "192k", "256k", "320k"], {"default": "192k", "tooltip": "Audio bitrate. Higher = better quality. 192k is good quality, 320k is near-lossless."}),
                 "use_source_fps": ("BOOLEAN", {"default": True, "tooltip": "If True, uses the original video's FPS. If False, uses the fps setting above."}),
             },
@@ -951,7 +951,7 @@ class RizzSaveVideo:
         ext_map = {
             'libx264': 'mp4',
             'libx265': 'mp4',
-            'mpeg4': 'avi',
+            'mpeg4': 'mp4',
             'libvpx-vp9': 'webm'
         }
         ext = ext_map.get(codec, 'mp4')
@@ -966,30 +966,28 @@ class RizzSaveVideo:
         cmd = [
             'ffmpeg', '-y', '-i', input_path,
             '-c:v', codec,
-            '-preset', preset,
-            '-crf', str(quality_crf),
             '-pix_fmt', pixel_format,
             '-r', str(actual_fps),
         ]
+
+        # Codec-specific quality options
+        if codec in ['libx264', 'libx265']:
+            cmd.extend(['-preset', preset, '-crf', str(quality_crf)])
+        elif codec == 'libvpx-vp9':
+            cmd.extend(['-crf', str(quality_crf), '-b:v', '0'])
+        elif codec == 'mpeg4':
+            # MPEG-4 does not use CRF/preset; map quality_crf 0..51 -> qscale 1..31
+            mpeg4_q = max(1, min(31, int(round(1 + (quality_crf / 51.0) * 30))))
+            cmd.extend(['-q:v', str(mpeg4_q)])
         
         # Audio settings
         if video['has_audio']:
-            cmd.extend(['-c:a', audio_codec, '-b:a', audio_bitrate])
+            if codec == 'libvpx-vp9':
+                cmd.extend(['-c:a', 'libopus', '-b:a', audio_bitrate])
+            else:
+                cmd.extend(['-c:a', audio_codec, '-b:a', audio_bitrate])
         else:
             cmd.extend(['-an'])  # No audio
-        
-        # VP9 specific settings
-        if codec == 'libvpx-vp9':
-            # VP9 uses different quality setting
-            cmd = [
-                'ffmpeg', '-y', '-i', input_path,
-                '-c:v', codec,
-                '-crf', str(quality_crf), '-b:v', '0',
-                '-pix_fmt', pixel_format,
-                '-r', str(actual_fps),
-            ]
-            if video['has_audio']:
-                cmd.extend(['-c:a', 'libopus', '-b:a', audio_bitrate])
         
         cmd.append(output_path)
         
@@ -1631,4 +1629,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzExtractAllFrames": "🎞️ Extract ALL Frames (Batch)",
     "RizzEditClips": "✂️ Edit & Combine Clips (Rizz)",
 }
-
