@@ -36,9 +36,10 @@ app.registerExtension({
     async nodeCreated(node) {
         if (node.comfyClass !== "RizzLoadAudio" && node.comfyClass !== "RizzLoadVideo" && node.comfyClass !== "RizzLoadImage") return;
 
+        const isImageNode = node.comfyClass === "RizzLoadImage";
         let type = "audio";
         if (node.comfyClass === "RizzLoadVideo") type = "video";
-        if (node.comfyClass === "RizzLoadImage") type = "image";
+        if (isImageNode) type = "image";
 
         console.log(`[RizzNodes] Setting up dynamic ${type} combo for ${node.comfyClass}`);
 
@@ -58,45 +59,59 @@ app.registerExtension({
         };
 
         let previewRequestToken = 0;
+        const emptySelection = isImageNode ? "" : "None";
+        const folderWidgetName = isImageNode ? "folder" : "folder_path";
+        const fileWidgetName = isImageNode ? "image" : "file";
+        const folderWidget = node.widgets.find(w => w.name === folderWidgetName);
+        const customPathWidget = isImageNode ? node.widgets.find(w => w.name === "custom_path") : null;
+        const fileWidget = node.widgets.find(w => w.name === fileWidgetName);
 
         const updateFileWidget = (files) => {
-            const widget = node.widgets.find(w => w.name === "image");
-            if (!widget) return;
+            if (!fileWidget) return;
 
-            const values = files && files.length ? files : [""];
-            widget.options.values = values;
+            const values = files && files.length ? files : [emptySelection];
+            fileWidget.options.values = values;
 
-            if (!values.includes(widget.value)) {
-                widget.value = files && files.length > 0 ? files[0] : "";
+            if (!values.includes(fileWidget.value)) {
+                fileWidget.value = files && files.length > 0 ? files[0] : emptySelection;
             }
 
             node.setDirtyCanvas(true, true);
-            updatePreview(widget.value, false);
+            if (isImageNode) {
+                updatePreview(fileWidget.value, false);
+            }
         };
 
-        const folderWidget = node.widgets.find(w => w.name === "folder");
-        const customPathWidget = node.widgets.find(w => w.name === "custom_path");
-
         const updateFiles = async () => {
-            let path = "RizzImage"; // Default None
+            let path = type === "video" ? "RizzVideo" : type === "audio" ? "RizzAudio" : "RizzImage";
 
-            if (folderWidget.value === "Custom") {
-                path = customPathWidget.value;
-                // Show custom path
-                customPathWidget.type = customPathWidget.origType || "STRING";
-            } else {
-                if (folderWidget.value !== "None") {
-                    path = "RizzImage/" + folderWidget.value;
+            if (isImageNode) {
+                if (folderWidget?.value === "Custom") {
+                    path = customPathWidget?.value ?? "";
+                    // Show custom path
+                    if (customPathWidget) {
+                        customPathWidget.type = customPathWidget.origType || "STRING";
+                    }
+                } else {
+                    if (folderWidget?.value && folderWidget.value !== "None") {
+                        path = "RizzImage/" + folderWidget.value;
+                    }
+                    // Hide custom path
+                    if (customPathWidget) {
+                        if (!customPathWidget.origType) customPathWidget.origType = customPathWidget.type;
+                        customPathWidget.type = "tschide";
+                    }
                 }
-                // Hide custom path
-                if (!customPathWidget.origType) customPathWidget.origType = customPathWidget.type;
-                customPathWidget.type = "tschide";
+            } else if (folderWidget?.value) {
+                path = folderWidget.value;
             }
 
-            // Expand node if visibility changed caused widgets to overflow
-            const minSize = node.computeSize();
-            if (node.size[0] < minSize[0] || node.size[1] < minSize[1]) {
-                node.setSize([Math.max(node.size[0], minSize[0]), Math.max(node.size[1], minSize[1])]);
+            if (isImageNode) {
+                // Expand node if visibility changed caused widgets to overflow
+                const minSize = node.computeSize();
+                if (node.size[0] < minSize[0] || node.size[1] < minSize[1]) {
+                    node.setSize([Math.max(node.size[0], minSize[0]), Math.max(node.size[1], minSize[1])]);
+                }
             }
 
             // Fetch files
@@ -110,7 +125,7 @@ app.registerExtension({
             };
         }
 
-        if (customPathWidget) {
+        if (customPathWidget && folderWidget) {
             // Cache original type
             customPathWidget.origType = customPathWidget.type;
             // Hide initially if not 'Custom'
@@ -133,8 +148,17 @@ app.registerExtension({
             updateFiles();
         }, 500);
 
+        if (!isImageNode) {
+            const onConfigure = node.onConfigure;
+            node.onConfigure = function () {
+                if (onConfigure) onConfigure.apply(this, arguments);
+                updateFiles();
+            };
+            return;
+        }
+
         // Preview Logic
-        const imageWidget = node.widgets.find(w => w.name === "image");
+        const imageWidget = fileWidget;
         if (imageWidget && imageWidget.value === "None") {
             imageWidget.value = "";
         }
@@ -208,9 +232,9 @@ app.registerExtension({
             const requestToken = ++previewRequestToken;
             const cacheBuster = Date.now();
             let folder_path = "RizzImage";
-            if (folderWidget.value === "Custom") {
-                folder_path = customPathWidget.value;
-            } else if (folderWidget.value !== "None") {
+            if (folderWidget?.value === "Custom") {
+                folder_path = customPathWidget?.value ?? "";
+            } else if (folderWidget?.value && folderWidget.value !== "None") {
                 folder_path = "RizzImage/" + folderWidget.value;
             }
 
