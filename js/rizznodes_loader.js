@@ -62,14 +62,20 @@ app.registerExtension({
         const emptySelection = isImageNode ? "" : "None";
         const folderWidgetName = isImageNode ? "folder" : "folder_path";
         const fileWidgetName = isImageNode ? "image" : "file";
-        const folderWidget = node.widgets.find(w => w.name === folderWidgetName);
-        const customPathWidget = isImageNode ? node.widgets.find(w => w.name === "custom_path") : null;
-        const fileWidget = node.widgets.find(w => w.name === fileWidgetName);
+        const getWidget = (name) => {
+            if (!Array.isArray(node.widgets)) return null;
+            return node.widgets.find((w) => w?.name === name) || null;
+        };
+        const getFolderWidget = () => getWidget(folderWidgetName);
+        const getCustomPathWidget = () => (isImageNode ? getWidget("custom_path") : null);
+        const getFileWidget = () => getWidget(fileWidgetName);
 
         const updateFileWidget = (files) => {
+            const fileWidget = getFileWidget();
             if (!fileWidget) return;
 
             const values = files && files.length ? files : [emptySelection];
+            if (!fileWidget.options) fileWidget.options = {};
             fileWidget.options.values = values;
 
             if (!values.includes(fileWidget.value)) {
@@ -83,6 +89,8 @@ app.registerExtension({
         };
 
         const updateFiles = async () => {
+            const folderWidget = getFolderWidget();
+            const customPathWidget = getCustomPathWidget();
             let path = type === "video" ? "RizzVideo" : type === "audio" ? "RizzAudio" : "RizzImage";
 
             if (isImageNode) {
@@ -119,13 +127,21 @@ app.registerExtension({
             updateFileWidget(files);
         };
 
-        if (folderWidget) {
-            folderWidget.callback = () => {
+        const bindFolderWidget = () => {
+            const folderWidget = getFolderWidget();
+            if (!folderWidget || folderWidget.__rizz_loader_bound) return;
+            const originalCallback = folderWidget.callback;
+            folderWidget.callback = function () {
+                if (originalCallback) originalCallback.apply(this, arguments);
                 updateFiles();
             };
-        }
+            folderWidget.__rizz_loader_bound = true;
+        };
 
-        if (customPathWidget && folderWidget) {
+        const bindCustomPathWidget = () => {
+            const customPathWidget = getCustomPathWidget();
+            const folderWidget = getFolderWidget();
+            if (!customPathWidget || !folderWidget || customPathWidget.__rizz_loader_bound) return;
             // Cache original type
             customPathWidget.origType = customPathWidget.type;
             // Hide initially if not 'Custom'
@@ -134,17 +150,29 @@ app.registerExtension({
             }
 
             // Update on enter?
-            customPathWidget.callback = () => {
-                if (folderWidget.value === "Custom") updateFiles();
+            const originalCallback = customPathWidget.callback;
+            customPathWidget.callback = function () {
+                if (originalCallback) originalCallback.apply(this, arguments);
+                const currentFolderWidget = getFolderWidget();
+                if (currentFolderWidget?.value === "Custom") updateFiles();
             };
-        }
+            customPathWidget.__rizz_loader_bound = true;
+        };
+
+        const bindCommonWidgets = () => {
+            bindFolderWidget();
+            if (isImageNode) bindCustomPathWidget();
+        };
 
         node.addWidget("button", "Refresh Files", null, () => {
             updateFiles();
         });
 
+        bindCommonWidgets();
+
         // Initial update
         setTimeout(() => {
+            bindCommonWidgets();
             updateFiles();
         }, 500);
 
@@ -152,13 +180,14 @@ app.registerExtension({
             const onConfigure = node.onConfigure;
             node.onConfigure = function () {
                 if (onConfigure) onConfigure.apply(this, arguments);
+                bindCommonWidgets();
                 updateFiles();
             };
             return;
         }
 
         // Preview Logic
-        const imageWidget = fileWidget;
+        let imageWidget = getFileWidget();
         if (imageWidget && imageWidget.value === "None") {
             imageWidget.value = "";
         }
@@ -203,6 +232,8 @@ app.registerExtension({
 
         const ensureInputCopy = async (filename) => {
             if (!filename || filename === "None") return;
+            const folderWidget = getFolderWidget();
+            const customPathWidget = getCustomPathWidget();
             try {
                 await api.fetchApi("/rizz/ensure_input", {
                     method: "POST",
@@ -220,7 +251,8 @@ app.registerExtension({
             }
         };
 
-        function updatePreview(selectedValue = imageWidget?.value, adjustSize = false) {
+        function updatePreview(selectedValue = getFileWidget()?.value, adjustSize = false) {
+            imageWidget = getFileWidget();
             if (!imageWidget || !selectedValue || selectedValue === "None") {
                 previewRequestToken += 1;
                 node.rizz_img = null;
@@ -231,6 +263,8 @@ app.registerExtension({
             const filename = selectedValue;
             const requestToken = ++previewRequestToken;
             const cacheBuster = Date.now();
+            const folderWidget = getFolderWidget();
+            const customPathWidget = getCustomPathWidget();
             let folder_path = "RizzImage";
             if (folderWidget?.value === "Custom") {
                 folder_path = customPathWidget?.value ?? "";
@@ -350,70 +384,70 @@ app.registerExtension({
         };
 
         // Hide the widget's built-in image preview to avoid double rendering
-        if (imageWidget) {
-            imageWidget.computeSize = function (width) {
-                return [width, 30];
-            };
+        const bindImageWidget = () => {
+            imageWidget = getFileWidget();
+            if (!imageWidget) return;
 
-            const originalDraw = imageWidget.draw;
-            if (typeof originalDraw === "function") {
-                imageWidget.draw = function (ctx, node, widgetWidth, y, widgetHeight) {
-                    const savedImage = this.image;
-                    this.image = null;
-                    try {
-                        originalDraw.apply(this, arguments);
-                    } finally {
-                        this.image = savedImage;
-                    }
+            if (!imageWidget.__rizz_preview_draw_bound) {
+                imageWidget.computeSize = function (width) {
+                    return [width, 30];
                 };
-            }
-        }
 
-        // Update preview on changes
-        if (imageWidget) {
-            const origCallback = imageWidget.callback;
-            imageWidget.callback = function (v) {
-                if (origCallback) origCallback.apply(this, arguments);
-                if (typeof v === "string" && v.length > 0) {
-                    imageWidget.value = v;
+                const originalDraw = imageWidget.draw;
+                if (typeof originalDraw === "function") {
+                    imageWidget.draw = function (ctx, node, widgetWidth, y, widgetHeight) {
+                        const savedImage = this.image;
+                        this.image = null;
+                        try {
+                            originalDraw.apply(this, arguments);
+                        } finally {
+                            this.image = savedImage;
+                        }
+                    };
                 }
-                node.imgs = null;
-                ensureInputCopy(imageWidget.value);
-                updatePreview(imageWidget.value, false);
-            };
-        }
+
+                imageWidget.__rizz_preview_draw_bound = true;
+            }
+
+            if (!imageWidget.__rizz_preview_callback_bound) {
+                const origCallback = imageWidget.callback;
+                imageWidget.callback = function (v) {
+                    if (origCallback) origCallback.apply(this, arguments);
+                    const currentImageWidget = getFileWidget();
+                    if (currentImageWidget && typeof v === "string" && v.length > 0) {
+                        currentImageWidget.value = v;
+                    }
+                    const selected = currentImageWidget?.value;
+                    node.imgs = null;
+                    ensureInputCopy(selected);
+                    updatePreview(selected, false);
+                };
+                imageWidget.__rizz_preview_callback_bound = true;
+            }
+        };
+
+        bindImageWidget();
 
         // Re-fetch preview after execution so overwritten files update in-place.
         const origOnExecuted = node.onExecuted;
         node.onExecuted = function () {
             if (origOnExecuted) origOnExecuted.apply(this, arguments);
             this.imgs = null;
-            updatePreview(imageWidget?.value, false);
+            updatePreview(getFileWidget()?.value, false);
         };
 
         const onConfigure = node.onConfigure;
         node.onConfigure = function () {
             if (onConfigure) onConfigure.apply(this, arguments);
+            bindCommonWidgets();
+            bindImageWidget();
+            const imageWidget = getFileWidget();
             if (imageWidget && imageWidget.value === "None") {
                 imageWidget.value = "";
             }
             ensurePreviewNodeSize();
             updateFiles();
         };
-
-        // Also update on refresh files
-        const origUpdate = updateFiles;
-        // We defined updateFiles as const, so we can't easily hook it unless we defined it inside this scope (which we did).
-        // Actually, updateFiles calls updateFileWidget.
-        // We can just call updatePreview() inside the button callback or after updateFiles resolves.
-        // We already have: node.addWidget("button", "Refresh Files", ..., () => { updateFiles(); });
-        // Let's check updatePreview triggers when widget value changes via code? 
-        // Usually modifying .value directly doesn't trigger callback.
-        // So we might need to manually call it.
-
-        // Better: Hook updatePreview into updateFileWidget or call it after setting value.
-        // But updateFileWidget is defined above.
-        // We can just add a listener or call updatePreview() periodically? No.
 
         // Initialize size once; later image switches should not resize.
         setTimeout(() => {

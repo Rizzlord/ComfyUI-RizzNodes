@@ -13,6 +13,8 @@ app.registerExtension({
             setupPreviewNode(node);
         } else if (node.comfyClass === "RizzLoadImage") {
             setupLoadNode(node);
+        } else if (node.comfyClass === "RizzUpscaleImageBatch") {
+            setupUpscaleBatchNode(node);
         }
     }
 });
@@ -192,4 +194,64 @@ function setupLoadNode(node) {
     node.__rizz_image_setup = true;
     // RizzLoadImage preview/layout is controlled in rizznodes_loader.js.
     // Keeping a second resize-toggle handler here causes size drift.
+}
+
+function setupUpscaleBatchNode(node) {
+    if (node.__rizz_upscale_setup) return;
+    if (!node.widgets) {
+        setTimeout(() => setupUpscaleBatchNode(node), 50);
+        return;
+    }
+    node.__rizz_upscale_setup = true;
+
+    const fixedResolutionWidget = node.widgets.find(w => w.name === "fixed_resolution");
+    if (!fixedResolutionWidget) return;
+
+    if (!fixedResolutionWidget.origType) fixedResolutionWidget.origType = fixedResolutionWidget.type;
+    if (!fixedResolutionWidget.origComputeSize) fixedResolutionWidget.origComputeSize = fixedResolutionWidget.computeSize;
+
+    const setWidgetVisible = (visible) => {
+        if (visible) {
+            if (fixedResolutionWidget.type === HIDDEN_TAG) {
+                fixedResolutionWidget.type = fixedResolutionWidget.origType;
+                fixedResolutionWidget.computeSize = fixedResolutionWidget.origComputeSize;
+            }
+        } else {
+            fixedResolutionWidget.type = HIDDEN_TAG;
+            fixedResolutionWidget.computeSize = () => [0, -4];
+        }
+    };
+
+    const hasUpscaleModelConnection = () => {
+        const modelInput = node.inputs?.find(input => input.name === "upscale_model");
+        if (!modelInput) return false;
+        if (modelInput.link != null) return true;
+        if (Array.isArray(modelInput.links) && modelInput.links.length > 0) return true;
+        return false;
+    };
+
+    const updateWidgetVisibility = () => {
+        const showFixedResolution = hasUpscaleModelConnection();
+        setWidgetVisible(showFixedResolution);
+
+        const minSize = node.computeSize();
+        if (node.size[0] < minSize[0] || node.size[1] < minSize[1]) {
+            node.setSize([Math.max(node.size[0], minSize[0]), Math.max(node.size[1], minSize[1])]);
+        }
+        requestAnimationFrame(() => node.setDirtyCanvas(true, true));
+    };
+
+    const origOnConnectionsChange = node.onConnectionsChange;
+    node.onConnectionsChange = function () {
+        if (origOnConnectionsChange) origOnConnectionsChange.apply(this, arguments);
+        updateWidgetVisibility();
+    };
+
+    const origOnConfigure = node.onConfigure;
+    node.onConfigure = function () {
+        if (origOnConfigure) origOnConfigure.apply(this, arguments);
+        setTimeout(updateWidgetVisibility, 0);
+    };
+
+    setTimeout(updateWidgetVisibility, 50);
 }

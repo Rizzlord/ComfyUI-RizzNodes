@@ -434,7 +434,6 @@ class RizzUpscaleImageBatch:
         return {
             "required": {
                 "images": ("IMAGE", ),
-                "upscale_model": ("UPSCALE_MODEL", ),
                 "fixed_resolution": ("BOOLEAN", {"default": False}),
                 "width": ("INT", {"default": 512, "min": 0, "max": 8192}),
                 "height": ("INT", {"default": 512, "min": 0, "max": 8192}),
@@ -442,6 +441,7 @@ class RizzUpscaleImageBatch:
                 "vram_cleanup": ("BOOLEAN", {"default": True, "label": "VRAM Cleanup (Slows down batch)"}),
             },
             "optional": {
+                "upscale_model": ("UPSCALE_MODEL", ),
                 "masks": ("MASK",),
                 "output_type": (["BATCH", "CONCATENATED_GRID"], {"default": "BATCH"}),
             }
@@ -452,7 +452,7 @@ class RizzUpscaleImageBatch:
     FUNCTION = "upscale_batch"
     CATEGORY = "RizzNodes/Image"
 
-    def upscale_batch(self, images, upscale_model, fixed_resolution, width, height, scale_method, vram_cleanup=True, masks=None, output_type="BATCH"):
+    def upscale_batch(self, images, fixed_resolution, width, height, scale_method, vram_cleanup=True, upscale_model=None, masks=None, output_type="BATCH"):
         def _normalize_mask_batch(mask_batch):
             if mask_batch.dim() == 4:
                 if mask_batch.shape[1] == 1:
@@ -487,10 +487,9 @@ class RizzUpscaleImageBatch:
                 return tensor[0]
             return tensor
 
-        if not callable(upscale_model):
-            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
-            return (empty_image, empty_mask)
+        use_upscale_model = callable(upscale_model)
+        if upscale_model is not None and not use_upscale_model:
+            print("RizzUpscaleImageBatch: Provided upscale_model is not callable. Falling back to Lanczos resize.")
 
         if not isinstance(images, torch.Tensor):
             raise ValueError("Images input must be a torch.Tensor.")
@@ -509,7 +508,7 @@ class RizzUpscaleImageBatch:
             return (empty_image, empty_mask)
 
         inference_context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
-        descriptor_mode = all([
+        descriptor_mode = use_upscale_model and all([
             hasattr(upscale_model, "model"),
             hasattr(upscale_model, "scale"),
             hasattr(upscale_model, "to"),
@@ -574,8 +573,7 @@ class RizzUpscaleImageBatch:
                             current_tile //= 2
                             if current_tile < 128:
                                 raise oom_error
-                    upscaled_device = descriptor_device
-                else:
+                elif use_upscale_model:
                     with inference_context():
                         upscaled = upscale_model(image_tensor_permuted)
                     if not isinstance(upscaled, torch.Tensor):
@@ -586,16 +584,25 @@ class RizzUpscaleImageBatch:
 
                     upscaled = upscaled.to(image_tensor.device, dtype=torch.float32)
                     upscaled_device = upscaled.device
+                else:
+                    # No model connected: use source image and apply fixed Lanczos resize below.
+                    upscaled = image_tensor_permuted.to(image_tensor.device, dtype=torch.float32)
+                    upscaled_device = upscaled.device
 
             except Exception as e:
                 print(f"RizzUpscaleImageBatch: Error during upscale: {e}")
                 upscaled = torch.zeros_like(image_tensor_permuted)
-            if fixed_resolution:
+            force_lanczos_resize = not use_upscale_model
+            should_resize = fixed_resolution or force_lanczos_resize
+            if should_resize:
                 upscaled_np = upscaled.permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()
                 upscaled_np = np.clip(upscaled_np, 0.0, 1.0)
                 upscaled_pil = Image.fromarray((upscaled_np * 255).astype(np.uint8))
-                target_resolution = (width, height)
-                resized_pil = upscaled_pil.resize(target_resolution, resampling_filter)
+                target_w = max(int(width), 1)
+                target_h = max(int(height), 1)
+                target_resolution = (target_w, target_h)
+                current_filter = Image.LANCZOS if force_lanczos_resize else resampling_filter
+                resized_pil = upscaled_pil.resize(target_resolution, current_filter)
                 resized_np = np.array(resized_pil).astype(np.float32) / 255.0
                 upscaled = torch.from_numpy(resized_np).unsqueeze(0).permute(0, 3, 1, 2).to(image_tensor.device)
             target_h = upscaled.shape[2]
@@ -667,7 +674,7 @@ class RizzUpscaleImageBatch:
         )
 
     @classmethod
-    def IS_CHANGED(s, images, upscale_model, fixed_resolution, width, height, scale_method, vram_cleanup=True, masks=None, output_type="BATCH"):
+    def IS_CHANGED(s, images, fixed_resolution, width, height, scale_method, vram_cleanup=True, upscale_model=None, masks=None, output_type="BATCH"):
         return float("NaN")
 
 class RizzBlur:
