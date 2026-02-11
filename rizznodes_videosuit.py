@@ -1044,55 +1044,61 @@ class RizzPreviewVideo:
         random_suffix = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
         preview_filename = f"ComfyUI_temp_{random_suffix}_.mp4"
         preview_path = os.path.join(temp_dir, preview_filename)
+
+        def _preview_ready(path):
+            return os.path.exists(path) and os.path.getsize(path) > 0
         
-        # If max_size is set, resize the video for preview
+        # Always transcode preview to browser-safe H.264/AAC.
+        # Some MP4 inputs (e.g. x265 or mpeg4 codec) won't play in browser players.
+        vf_filters = []
         if max_size > 0 and (video['width'] > max_size or video['height'] > max_size):
-            # Scale down for preview
             scale_flags = ":flags=neighbor" if pixel_perfect else ""
-            cmd = [
-                'ffmpeg', '-y', '-i', input_path,
-                '-vf', f"scale='min({max_size},iw)':'min({max_size},ih)':force_original_aspect_ratio=decrease{scale_flags}",
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-                '-c:a', 'aac', '-b:a', '128k',
-                preview_path
-            ]
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=120)
-            except:
-                # Fallback to copy
-                shutil.copy2(input_path, preview_path)
+            vf_filters.append(
+                f"scale='min({max_size},iw)':'min({max_size},ih)':force_original_aspect_ratio=decrease{scale_flags}"
+            )
+        vf_filters.append("format=yuv420p")
+
+        cmd = [
+            'ffmpeg', '-y', '-i', input_path,
+            '-vf', ",".join(vf_filters),
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        ]
+        if video.get('has_audio', False):
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
         else:
-            # Copy the video to temp directory for web serving
-            # If already mp4, just copy; otherwise transcode to mp4 for browser compatibility
-            if input_path.lower().endswith('.mp4'):
-                shutil.copy2(input_path, preview_path)
-            else:
-                cmd = [
-                    'ffmpeg', '-y', '-i', input_path,
-                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                    '-c:a', 'aac', '-b:a', '192k',
-                    preview_path
-                ]
-                try:
-                    subprocess.run(cmd, capture_output=True, timeout=120)
-                except:
-                    shutil.copy2(input_path, preview_path)
+            cmd.extend(['-an'])
+        cmd.append(preview_path)
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr[:500] if result.stderr else "ffmpeg preview transcode failed")
+        except Exception as e:
+            print(f"[RizzNodes VideoSuit] Preview transcode fallback: {e}")
+            # Fallback to copy so at least the file remains accessible for download.
+            shutil.copy2(input_path, preview_path)
+
+        # Last-chance fallback in case ffmpeg/copy produced no valid file
+        if not _preview_ready(preview_path):
+            shutil.copy2(input_path, preview_path)
+            if not _preview_ready(preview_path):
+                raise RuntimeError("Failed to prepare video preview file.")
         
-        # Return UI data in the format ComfyUI expects for video preview
-        # This matches the PreviewVideo format: {"images": [...], "animated": (True,)}
+        # The custom frontend handler reads `videos`/`video`.
+        preview_entry = {
+            "filename": preview_filename,
+            "subfolder": "",
+            "type": "temp",
+            "format": "video/mp4",
+            "autoplay": autoplay,
+            "loop": loop,
+        }
         return {
             "ui": {
-                "images": [{
-                    "filename": preview_filename,
-                    "subfolder": "",
-                    "type": "temp"
-                }],
-                "animated": (True,)
+                "videos": [preview_entry],
+                "video": [preview_entry],
             }
         }
-
-
-        return (output_path, output_video)
 
 
 # ============================================================================
@@ -1286,7 +1292,115 @@ class RizzExtractAllFrames:
 
 
 # ============================================================================
-# Node 8: RizzEditClips
+# Node 8: RizzFramesToVideoBatch
+# ============================================================================
+
+class RizzFramesToVideoBatch:
+    """Convert a batch of IMAGE frames into a VIDEO object for downstream nodes."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120, "tooltip": "Frames per second for the created video."}),
+            },
+            "optional": {
+                "limit_frames": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Limit number of frames to encode. 0 = encode all frames."}),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "frames_to_video"
+    CATEGORY = "RizzNodes/Video"
+
+    def frames_to_video(self, images, fps, limit_frames=0):
+        import shutil
+
+        if images is None:
+            raise ValueError("No input images provided.")
+
+        # Ensure BHWC tensor
+        if len(images.shape) == 3:
+            images = images.unsqueeze(0)
+        if len(images.shape) != 4:
+            raise ValueError(f"Expected IMAGE batch in BHWC format, got shape: {tuple(images.shape)}")
+
+        total_frames = int(images.shape[0])
+        if total_frames <= 0:
+            raise ValueError("Input image batch is empty.")
+
+        frame_count = min(total_frames, int(limit_frames)) if limit_frames and limit_frames > 0 else total_frames
+        if frame_count <= 0:
+            raise ValueError("No frames selected for encoding.")
+
+        height = int(images.shape[1])
+        width = int(images.shape[2])
+
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+
+        frames_dir = tempfile.mkdtemp(prefix="rizz_frames_to_video_", dir=temp_dir)
+        output_path = os.path.join(temp_dir, f"rizz_frames_to_video_{uuid.uuid4().hex}.mp4")
+
+        try:
+            # Write frame sequence for ffmpeg input
+            for i in range(frame_count):
+                frame = images[i]
+                frame_np = np.clip(frame.detach().cpu().numpy(), 0.0, 1.0)
+
+                # Normalize to RGB for video encoding
+                if frame_np.ndim == 2:
+                    frame_np = np.stack([frame_np, frame_np, frame_np], axis=-1)
+                elif frame_np.shape[-1] == 1:
+                    frame_np = np.repeat(frame_np, 3, axis=-1)
+                elif frame_np.shape[-1] >= 3:
+                    frame_np = frame_np[..., :3]
+                else:
+                    raise ValueError(f"Unsupported channel count in frame: {frame_np.shape}")
+
+                frame_u8 = (frame_np * 255.0).astype(np.uint8)
+                frame_img = Image.fromarray(frame_u8, mode="RGB")
+                frame_img.save(os.path.join(frames_dir, f"frame_{i:06d}.png"))
+
+            # Build ffmpeg command
+            cmd = [
+                'ffmpeg', '-y',
+                '-framerate', str(fps),
+                '-start_number', '0',
+                '-i', os.path.join(frames_dir, 'frame_%06d.png'),
+            ]
+
+            # yuv420p requires even dimensions; pad if needed.
+            if width % 2 != 0 or height % 2 != 0:
+                cmd.extend(['-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2'])
+
+            cmd.extend([
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '18',
+                '-pix_fmt', 'yuv420p',
+                '-an',
+                output_path
+            ])
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                print(f"[RizzNodes VideoSuit] FramesToVideo error: {result.stderr}")
+                raise RuntimeError(f"FFmpeg failed: {result.stderr[:500]}")
+
+            output_video = get_video_info(output_path)
+            output_video['has_audio'] = False
+            return (output_video,)
+
+        finally:
+            # Clean temporary frame sequence
+            shutil.rmtree(frames_dir, ignore_errors=True)
+
+
+# ============================================================================
+# Node 9: RizzEditClips
 # ============================================================================
 
 MAX_VIDEO_SLOTS = 25
@@ -1615,6 +1729,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzPreviewVideo": RizzPreviewVideo,
     "RizzSeparateVideoAudio": RizzSeparateVideoAudio,
     "RizzExtractAllFrames": RizzExtractAllFrames,
+    "RizzFramesToVideoBatch": RizzFramesToVideoBatch,
     "RizzEditClips": RizzEditClips,
 }
 
@@ -1627,5 +1742,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzPreviewVideo": "📺 Preview Video (Rizz)",
     "RizzSeparateVideoAudio": "🔊 Separate Video/Audio",
     "RizzExtractAllFrames": "🎞️ Extract ALL Frames (Batch)",
+    "RizzFramesToVideoBatch": "🎞️ Frames to Video (Batch)",
     "RizzEditClips": "✂️ Edit & Combine Clips (Rizz)",
 }
