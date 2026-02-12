@@ -95,6 +95,33 @@ def get_video_info(video_path):
             'has_audio': False
         }
 
+def ensure_video_dict(video):
+    """Ensure the video input is a dictionary. If it's a VideoInput object (like VideoFromComponents),
+    save it to a temporary file and return the metadata dictionary."""
+    if isinstance(video, dict) and 'path' in video:
+        return video
+    
+    # Handle new ComfyAPI VideoInput objects (e.g., VideoFromComponents, VideoFromFile)
+    if hasattr(video, 'save_to'):
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"rizz_vinput_{uuid.uuid4().hex}.mp4")
+        
+        try:
+            # We use .save_to() specifically for VideoInput subclasses in ComfyUI Core/API
+            video.save_to(temp_path)
+            return get_video_info(temp_path)
+        except Exception as e:
+            print(f"[RizzNodes VideoSuit] Error converting video object: {e}")
+            if isinstance(video, dict): return video 
+            raise ValueError(f"Failed to process video input object of type {type(video).__name__}")
+            
+    # Fallback
+    if isinstance(video, dict):
+        return video
+        
+    raise TypeError(f"Expected VIDEO (dict) or VideoInput object, got {type(video).__name__}. Objects of this type are not subscriptable; ensure you are using compatible video nodes.")
+
 
 def extract_frame_at_time(video_path, time_seconds):
     """Extract a single frame at specified time using ffmpeg."""
@@ -339,6 +366,7 @@ class RizzExtractFrames:
     CATEGORY = "RizzNodes/Video"
     
     def extract_frames(self, video):
+        video = ensure_video_dict(video)
         video_path = video['path']
         duration = video['duration']
         frame_count = video.get('frame_count', 0)
@@ -469,7 +497,7 @@ class RizzVideoEffects:
                       brightness=0.0, contrast=1.0, saturation=1.0,
                       end_with_audio=True, interpolation_mode="None", **kwargs):
         """Apply video effects with dynamic audio/image inputs from kwargs."""
-        
+        video = ensure_video_dict(video)
         input_path = video['path']
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
@@ -939,6 +967,7 @@ class RizzSaveVideo:
                    preset="medium", pixel_format="yuv420p", audio_codec="aac",
                    audio_bitrate="192k", use_source_fps=True, prompt=None, extra_pnginfo=None):
         
+        video = ensure_video_dict(video)
         input_path = video['path']
         output_dir = folder_paths.get_output_directory()
         
@@ -1036,6 +1065,7 @@ class RizzPreviewVideo:
         import shutil
         import random
         
+        video = ensure_video_dict(video)
         input_path = video['path']
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
@@ -1123,13 +1153,7 @@ class RizzSeparateVideoAudio:
     
     def separate(self, video):
         # Extract audio and also create a muted video file
-        
-        # Check if video has audio
-        if not video.get('has_audio', False):
-             # Return as-is
-             empty_audio = {"waveform": torch.zeros((1, 1), dtype=torch.float32), "sample_rate": 48000}
-             return (video, empty_audio)
-             
+        video = ensure_video_dict(video)
         input_path = video['path']
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
@@ -1217,6 +1241,7 @@ class RizzExtractAllFrames:
     CATEGORY = "RizzNodes/Video"
     
     def extract_all(self, video, limit_frames=0, start_time=0.0, end_time=0.0):
+        video = ensure_video_dict(video)
         video_path = video['path']
         import cv2
         
