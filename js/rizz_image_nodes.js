@@ -62,10 +62,26 @@ function restoreLastPreview(node) {
 // Helper: hook onExecuted to persist a lightweight
 // preview reference (just filename/subfolder/type)
 // ─────────────────────────────────────────────────
-function hookOnExecuted(node) {
+function hookOnExecuted(node, options = {}) {
+    const suppressCoreImageHandling = options.suppressCoreImageHandling === true;
     const origOnExecuted = node.onExecuted;
     node.onExecuted = function (message) {
-        if (origOnExecuted) origOnExecuted.apply(this, arguments);
+        const sizeBefore = this.size ? this.size.slice() : null;
+        let messageForCore = message;
+
+        if (suppressCoreImageHandling && message && typeof message === "object") {
+            messageForCore = { ...message };
+            delete messageForCore.images;
+            delete messageForCore.gifs;
+        }
+
+        if (origOnExecuted) {
+            if (suppressCoreImageHandling) {
+                origOnExecuted.call(this, messageForCore);
+            } else {
+                origOnExecuted.apply(this, arguments);
+            }
+        }
 
         // Extract the image info from the execution result
         const uiImages = message?.images;
@@ -78,6 +94,20 @@ function hookOnExecuted(node) {
                 subfolder: last.subfolder || "",
                 type: last.type || "output",
             };
+
+            if (suppressCoreImageHandling) {
+                loadPreviewImage(this, this.properties.rizz_last_preview);
+            }
+        }
+
+        // Keep manual node sizing stable when saving repeatedly.
+        if (
+            suppressCoreImageHandling &&
+            sizeBefore &&
+            this.size &&
+            (this.size[0] !== sizeBefore[0] || this.size[1] !== sizeBefore[1])
+        ) {
+            this.setSize(sizeBefore);
         }
     };
 }
@@ -149,7 +179,7 @@ function setupSaveNode(node) {
     if (node.__rizz_image_setup) return;
     node.__rizz_image_setup = true;
 
-    hookOnExecuted(node);
+    hookOnExecuted(node, { suppressCoreImageHandling: true });
     setupResizeToggle(node);
 
     // Restore preview on load / configure

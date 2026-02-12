@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 import json
+import re
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 import folder_paths
@@ -15,6 +16,7 @@ class RizzSaveImage:
             "required": {
                 "images": ("IMAGE",),
                 "model": (["None", "Flux", "flux2", "qwen", "qwenedit", "sd1.5", "sdxl", "sd3", "anime"],),
+                "image_name": ("STRING", {"default": "", "tooltip": "Optional custom base filename. Empty keeps default naming."}),
                 "resize": ("BOOLEAN", {"default": False, "tooltip": "Resize the image to the specified width and height."}),
                 "width": ("INT", {"default": 512, "min": 0, "max": 16384, "tooltip": "Target width for resizing."}),
                 "height": ("INT", {"default": 512, "min": 0, "max": 16384, "tooltip": "Target height for resizing."}),
@@ -105,11 +107,32 @@ class RizzSaveImage:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
         return Image.fromarray(arr)
 
-    def save_images(self, images, model, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None):
-        return self.save_images_main(images, model, resize, width, height, format, quality, save_metadata, upscale_model, prompt, extra_pnginfo, output_type="output")
+    def _sanitize_filename_prefix(self, name):
+        raw = os.path.splitext(os.path.basename(str(name or "").strip()))[0]
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", raw)
+        cleaned = cleaned.strip().strip(".")
+        return cleaned[:128]
 
-    def save_images_main(self, images, model, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None, output_type="output"):
-        filename_prefix = model
+    def save_images(self, images, model, image_name, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None):
+        return self.save_images_main(
+            images=images,
+            model=model,
+            image_name=image_name,
+            resize=resize,
+            width=width,
+            height=height,
+            format=format,
+            quality=quality,
+            save_metadata=save_metadata,
+            upscale_model=upscale_model,
+            prompt=prompt,
+            extra_pnginfo=extra_pnginfo,
+            output_type="output",
+        )
+
+    def save_images_main(self, images, model, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None, output_type="output", image_name=""):
+        custom_prefix = self._sanitize_filename_prefix(image_name)
+        filename_prefix = custom_prefix or model
 
         if output_type == "output":
             if model == "None":
@@ -286,7 +309,7 @@ class RizzPreviewImage(RizzSaveImage):
     CATEGORY = "RizzNodes/Image"
 
     def save_images(self, images):
-        return self.save_images_main(images, model="Preview", resize=False, width=0, height=0, format="png", quality=90, output_type="temp")
+        return self.save_images_main(images, model="Preview", image_name="", resize=False, width=0, height=0, format="png", quality=90, output_type="temp")
 
     @classmethod
     def VALIDATE_INPUTS(cls, images):
