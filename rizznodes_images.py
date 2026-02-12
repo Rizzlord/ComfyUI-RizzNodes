@@ -36,6 +36,75 @@ class RizzSaveImage:
     OUTPUT_NODE = True
     CATEGORY = "RizzNodes/Image"
 
+    def _flatten_images(self, images):
+        """Normalize IMAGE inputs into a flat list of HWC tensors."""
+        flat_images = []
+
+        def append_tensor(tensor_like):
+            tensor = tensor_like if torch.is_tensor(tensor_like) else torch.as_tensor(tensor_like)
+
+            # Convert obvious channel-first layouts (..., C, H, W) to channel-last (..., H, W, C).
+            if tensor.ndim >= 3 and tensor.shape[-1] not in (1, 3, 4) and tensor.shape[-3] in (1, 3, 4):
+                tensor = tensor.movedim(-3, -1)
+
+            if tensor.ndim == 2:
+                flat_images.append(tensor.unsqueeze(-1))
+                return
+
+            if tensor.ndim == 3:
+                flat_images.append(tensor)
+                return
+
+            if tensor.ndim >= 4:
+                if tensor.shape[-1] not in (1, 3, 4):
+                    raise TypeError(f"Unsupported image tensor shape: {tuple(tensor.shape)}")
+
+                tensor = tensor.reshape(-1, tensor.shape[-3], tensor.shape[-2], tensor.shape[-1])
+                flat_images.extend([frame for frame in tensor])
+                return
+
+            raise TypeError(f"Unsupported image tensor shape: {tuple(tensor.shape)}")
+
+        if torch.is_tensor(images) or isinstance(images, np.ndarray):
+            append_tensor(images)
+        elif isinstance(images, (list, tuple)):
+            for item in images:
+                if torch.is_tensor(item) or isinstance(item, np.ndarray):
+                    append_tensor(item)
+                else:
+                    raise TypeError(f"Unsupported image item type: {type(item)}")
+        else:
+            raise TypeError(f"Unsupported images input type: {type(images)}")
+
+        return flat_images
+
+    def _tensor_to_pil(self, image):
+        arr = image.detach().cpu().numpy() if torch.is_tensor(image) else np.asarray(image)
+
+        # Drop leading singleton batch dims so PIL sees HxW or HxWxC.
+        while arr.ndim > 3 and arr.shape[0] == 1:
+            arr = arr[0]
+
+        if arr.ndim > 3 and arr.shape[-1] in (1, 3, 4):
+            arr = arr.reshape(-1, arr.shape[-3], arr.shape[-2], arr.shape[-1])[0]
+
+        # Handle accidental CHW arrays.
+        if arr.ndim == 3 and arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
+            arr = np.moveaxis(arr, 0, -1)
+
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+
+        if arr.ndim not in (2, 3):
+            raise TypeError(f"Unsupported image shape for PIL conversion: {arr.shape}")
+
+        if np.issubdtype(arr.dtype, np.floating):
+            if arr.size and arr.max() <= 1.0:
+                arr = arr * 255.0
+
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr)
+
     def save_images(self, images, model, resize, width, height, format, quality, save_metadata=True, upscale_model=None, prompt=None, extra_pnginfo=None):
         return self.save_images_main(images, model, resize, width, height, format, quality, save_metadata, upscale_model, prompt, extra_pnginfo, output_type="output")
 
@@ -54,11 +123,18 @@ class RizzSaveImage:
             output_subfolder = ""
             filename_prefix = "RizzPreview" # For temp files
 
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, output_dir, images[0].shape[1], images[0].shape[0])
+        image_list = self._flatten_images(images)
+        if not image_list:
+            return {"ui": {"images": []}}
+
+        first_h, first_w = int(image_list[0].shape[0]), int(image_list[0].shape[1])
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, output_dir, first_w, first_h
+        )
         
         results = list()
         
-        for image in images:
+        for image in image_list:
             # Process image (Resize / Upscale)
             if upscale_model is not None:
                 image = self.upscale(image, upscale_model)
@@ -67,8 +143,7 @@ class RizzSaveImage:
             elif resize:
                 image = self.resize_image(image, width, height)
 
-            i = 255. * image.cpu().numpy()
-            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            img = self._tensor_to_pil(image)
             
             metadata = None
             exif_bytes = None
@@ -163,20 +238,14 @@ class RizzSaveImage:
         return { "ui": { "images": results } }
     
     def resize_image(self, image, width, height):
-        # image is [H, W, C] tensor or [1, H, W, C]
-        # We need [B, C, H, W] for interpolate usually, or just use PIL
-        
-        # Ensure BCHW for torch interpolate or HWC for PIL
-        # Using PIL for high quality Lanczos
-        if len(image.shape) > 3:
-            image = image.squeeze(0)
-        
-        i = 255. * image.cpu().numpy()
-        img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+        # Normalize first so inputs like [1, 1, H, W, C] are handled safely.
+        img = self._tensor_to_pil(image)
         img = img.resize((width, height), resample=Image.LANCZOS)
         
         # Back to tensor
         out = np.array(img).astype(np.float32) / 255.0
+        if out.ndim == 2:
+            out = out[..., None]
         return torch.from_numpy(out).unsqueeze(0)
 
     def upscale(self, image, upscale_model):
