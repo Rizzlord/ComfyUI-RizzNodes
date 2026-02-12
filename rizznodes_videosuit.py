@@ -102,25 +102,35 @@ def ensure_video_dict(video):
         return video
     
     # Handle new ComfyAPI VideoInput objects (e.g., VideoFromComponents, VideoFromFile)
-    if hasattr(video, 'save_to'):
+    if video is not None and hasattr(video, 'save_to'):
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
         temp_path = os.path.join(temp_dir, f"rizz_vinput_{uuid.uuid4().hex}.mp4")
         
         try:
             # We use .save_to() specifically for VideoInput subclasses in ComfyUI Core/API
+            print(f"[RizzNodes VideoSuit] Processing video input object of type: {type(video).__name__}")
             video.save_to(temp_path)
-            return get_video_info(temp_path)
+            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                return get_video_info(temp_path)
+            else:
+                print(f"[RizzNodes VideoSuit] Failed to save video object to {temp_path}")
         except Exception as e:
             print(f"[RizzNodes VideoSuit] Error converting video object: {e}")
             if isinstance(video, dict): return video 
-            raise ValueError(f"Failed to process video input object of type {type(video).__name__}")
             
-    # Fallback
+    # Fallback to dictionary checking if it's already a dict but maybe missing 'path'
     if isinstance(video, dict):
+        if 'path' in video: return video
+        # Maybe it's a different dict format?
         return video
         
-    raise TypeError(f"Expected VIDEO (dict) or VideoInput object, got {type(video).__name__}. Objects of this type are not subscriptable; ensure you are using compatible video nodes.")
+    # Final check: if it's a list, we might have a batch. 
+    # Current RizzNodes don't support batches of VideoInput objects directly yet.
+    if isinstance(video, (list, tuple)) and len(video) > 0:
+        return ensure_video_dict(video[0])
+
+    raise TypeError(f"Expected VIDEO (dict) or VideoInput object, got {type(video).__name__}. This node requires a compatible video format (dictionary with 'path' or ComfyUI VideoInput).")
 
 
 def extract_frame_at_time(video_path, time_seconds):
@@ -1154,6 +1164,13 @@ class RizzSeparateVideoAudio:
     def separate(self, video):
         # Extract audio and also create a muted video file
         video = ensure_video_dict(video)
+        
+        # Check if video has audio
+        if not video.get('has_audio', False):
+             # Return as-is
+             empty_audio = {"waveform": torch.zeros((1, 1, 1), dtype=torch.float32), "sample_rate": 44100}
+             return (video, empty_audio)
+             
         input_path = video['path']
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
@@ -1500,6 +1517,7 @@ class RizzEditClips:
         for i in range(1, video_count + 1):
             vid = kwargs.get(f"video_{i}")
             if vid:
+                vid = ensure_video_dict(vid)
                 video_inputs.append({
                     'video': vid,
                     'index': i,
