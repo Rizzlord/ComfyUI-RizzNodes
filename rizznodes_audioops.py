@@ -3,8 +3,10 @@ import subprocess
 import tempfile
 import uuid
 import torch
+import torchaudio
 import folder_paths
 import soundfile as sf
+import numpy as np
 
 # Maximum number of audio inputs to expose
 MAX_AUDIO_INPUTS = 50
@@ -325,7 +327,132 @@ class RizzAudioMixer:
         return ({"waveform": current_waveform, "sample_rate": current_sr}, float(duration))
 
 # ============================================================================
-# Node 2: RizzSaveAudio
+# Node 2: RizzAudioEditor
+# ============================================================================
+
+class RizzAudioEditor:
+    """Advanced audio editing with trim, volume, compression, and noise removal using TorchAudio GPU."""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "trim_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.01, "tooltip": "Seconds to trim from start"}),
+                "trim_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.01, "tooltip": "Seconds to trim from end"}),
+                "volume": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Volume multiplier"}),
+                "amplify_db": ("FLOAT", {"default": 0.0, "min": -60.0, "max": 60.0, "step": 0.1, "tooltip": "Amplify in Decibels"}),
+                "comp_threshold": ("FLOAT", {"default": -20.0, "min": -60.0, "max": 0.0, "step": 0.1, "tooltip": "Compression threshold in dB"}),
+                "comp_ratio": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 20.0, "step": 0.1, "tooltip": "Compression ratio (1.0 = no compression)"}),
+                "noise_reduction": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Strength of noise reduction (0=off)"}),
+                "punch": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Enhance contrast/punchiness (0=off)"}),
+                "normalize": ("BOOLEAN", {"default": False, "tooltip": "Normalize audio to 0dB peak"}),
+                "use_gpu": ("BOOLEAN", {"default": True, "tooltip": "Use GPU for processing if available"}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO", "FLOAT")
+    RETURN_NAMES = ("audio", "duration")
+    FUNCTION = "edit_audio"
+    CATEGORY = "RizzNodes/Audio"
+
+    def edit_audio(self, audio, trim_start, trim_end, volume, amplify_db, comp_threshold, comp_ratio, noise_reduction, punch, normalize, use_gpu):
+        waveform = audio["waveform"].clone()
+        sample_rate = audio["sample_rate"]
+        
+        device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+        waveform = waveform.to(device)
+        
+        # Helper to trim audio tensor [batch, channels, samples]
+        def local_trim(audio_tensor, sr, start_sec, end_sec):
+            total_samples = audio_tensor.shape[-1]
+            start_sample = int(start_sec * sr)
+            end_cut = int(end_sec * sr)
+            end_sample = max(start_sample, total_samples - end_cut)
+            if start_sample >= total_samples:
+                return audio_tensor[..., :0]
+            return audio_tensor[..., start_sample:end_sample]
+
+        # 1. Trim
+        if trim_start > 0 or trim_end > 0:
+            waveform = local_trim(waveform, sample_rate, trim_start, trim_end)
+        
+        if waveform.shape[-1] == 0:
+            return ({"waveform": torch.zeros((1, 2, 1)).to("cpu"), "sample_rate": sample_rate}, 0.0)
+
+        # 2. Volume & Amplify
+        if volume != 1.0:
+            waveform = waveform * volume
+        
+        if amplify_db != 0.0:
+            factor = 10 ** (amplify_db / 20)
+            waveform = waveform * factor
+            
+        # 3. Noise Reduction (Simple Spectral Subtraction)
+        if noise_reduction > 0:
+            n_fft = 2048
+            hop_length = 512
+            window = torch.hann_window(n_fft).to(waveform.device)
+            
+            # Work on [channels, samples]
+            is_batched = False
+            if waveform.dim() == 3:
+                is_batched = True
+                b, c, s = waveform.shape
+                # Process each batch or just the first if it's usually 1
+                wf_proc = waveform.view(b * c, s)
+            else:
+                wf_proc = waveform
+
+            spec = torch.stft(wf_proc, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+            mag = torch.abs(spec)
+            phase = torch.angle(spec)
+            
+            # Estimate noise from the whole clip (simplified)
+            # Use the bottom 10th percentile as noise floor estimate
+            noise_floor, _ = torch.kthvalue(mag, max(1, int(mag.shape[-1] * 0.1)), dim=-1, keepdim=True)
+            mag = torch.clamp(mag - (noise_floor * noise_reduction * 2.0), min=1e-8)
+            
+            spec_new = torch.polar(mag, phase)
+            wf_proc = torch.istft(spec_new, n_fft=n_fft, hop_length=hop_length, window=window, length=wf_proc.shape[-1])
+            
+            if is_batched:
+                waveform = wf_proc.view(b, c, -1)
+            else:
+                waveform = wf_proc
+
+        # 4. Compression (Dynamic Range Compressor)
+        if comp_ratio > 1.0:
+            # Convert threshold to linear amplitude
+            thresh_lin = 10 ** (comp_threshold / 20)
+            
+            # Simple soft-knee-ish approach
+            mag = torch.abs(waveform)
+            mask = mag > thresh_lin
+            
+            # Avoid division by zero and handle signals above threshold
+            if mask.any():
+                # compressed = threshold + (original - threshold) / ratio
+                # Note: this is a very basic "hard" compressor
+                waveform[mask] = torch.sign(waveform[mask]) * (thresh_lin + (mag[mask] - thresh_lin) / comp_ratio)
+
+        # 4.5. Punch (Contrast)
+        if punch > 0:
+            waveform = torchaudio.functional.contrast(waveform, enhancement_amount=punch)
+
+        # 5. Normalization
+        if normalize:
+            max_val = torch.max(torch.abs(waveform))
+            if max_val > 1e-8:
+                waveform = waveform / max_val
+
+        waveform = waveform.to("cpu")
+        duration = waveform.shape[-1] / sample_rate
+        
+        return ({"waveform": waveform, "sample_rate": sample_rate}, float(duration))
+
+# ============================================================================
+# Node 3: RizzSaveAudio
 # ============================================================================
 
 class RizzSaveAudio:
@@ -486,12 +613,14 @@ class RizzPreviewAudio:
 
 NODE_CLASS_MAPPINGS = {
     "RizzAudioMixer": RizzAudioMixer,
+    "RizzAudioEditor": RizzAudioEditor,
     "RizzSaveAudio": RizzSaveAudio,
     "RizzPreviewAudio": RizzPreviewAudio
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzAudioMixer": "Audio Mixer (Rizz)",
+    "RizzAudioEditor": "✨ Audio Editor (Rizz)",
     "RizzSaveAudio": "🎵 Save Audio (Rizz)",
     "RizzPreviewAudio": "🔊 Preview Audio (Rizz)"
 }
