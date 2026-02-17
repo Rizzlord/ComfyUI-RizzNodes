@@ -214,6 +214,71 @@ try:
             print(f"[RizzNodes] ensure_input error: {e}")
             return web.json_response({"ok": False})
 
+    @server.PromptServer.instance.routes.post("/rizz/video_first_frame")
+    async def video_first_frame(request):
+        try:
+            import subprocess
+            import folder_paths as fp
+            data = await request.json()
+            video_path = data.get("path", "")
+
+            if not video_path:
+                return web.json_response({"error": "no path"}, status=400)
+
+            if not os.path.isabs(video_path):
+                for base in [fp.get_output_directory(), fp.get_input_directory(),
+                             os.path.join(fp.get_output_directory(), "RizzVideo")]:
+                    candidate = os.path.join(base, video_path)
+                    if os.path.isfile(candidate):
+                        video_path = candidate
+                        break
+
+            if not os.path.isfile(video_path):
+                return web.json_response({"error": "not found"}, status=404)
+
+            probe_cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-show_format", video_path
+            ]
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            w, h, fc, fps_val = 640, 360, 100, 24.0
+            if probe.returncode == 0:
+                import json as _json
+                info = _json.loads(probe.stdout)
+                for s in info.get("streams", []):
+                    if s.get("codec_type") == "video":
+                        w = int(s.get("width", w))
+                        h = int(s.get("height", h))
+                        fc = int(s.get("nb_frames", 0)) or 100
+                        r = s.get("r_frame_rate", "24/1")
+                        parts = r.split("/")
+                        if len(parts) == 2 and float(parts[1]) > 0:
+                            fps_val = float(parts[0]) / float(parts[1])
+                        break
+                fmt = info.get("format", {})
+                dur = float(fmt.get("duration", 0))
+                if dur > 0 and fc <= 1:
+                    fc = int(dur * fps_val)
+
+            frame_cmd = [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vframes", "1", "-f", "image2pipe",
+                "-vcodec", "mjpeg", "-q:v", "5", "pipe:1"
+            ]
+            result = subprocess.run(frame_cmd, capture_output=True, timeout=10)
+            if result.returncode != 0 or not result.stdout:
+                return web.json_response({"error": "frame extraction failed"}, status=500)
+
+            resp = web.Response(body=result.stdout, content_type="image/jpeg")
+            resp.headers["X-Video-Width"] = str(w)
+            resp.headers["X-Video-Height"] = str(h)
+            resp.headers["X-Video-Frames"] = str(fc)
+            resp.headers["X-Video-FPS"] = str(round(fps_val, 3))
+            return resp
+        except Exception as e:
+            print(f"[RizzNodes] video_first_frame error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
 except ImportError:
     print("[RizzNodes] Failed to import server for backend routes.")
 

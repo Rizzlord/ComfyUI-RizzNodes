@@ -1760,6 +1760,300 @@ class RizzEditClips:
 
 
 # ============================================================================
+# Node 10: RizzBlurSpot
+# ============================================================================
+
+BLUR_INTERPOLATIONS = ["linear", "ease_in", "ease_out", "ease_in_out"]
+BLUR_PROCESSING_MODES = ["CPU (OpenCV)", "GPU (PyTorch)"]
+BLUR_SPOT_MODES = ["Blur", "Watermark Removal"]
+
+
+def _ease_in(t):
+    return t * t
+
+
+def _ease_out(t):
+    return 1.0 - (1.0 - t) * (1.0 - t)
+
+
+def _ease_in_out(t):
+    return 3.0 * t * t - 2.0 * t * t * t
+
+
+def _interpolate_keyframes(keyframes, frame_idx, total_frames, interp):
+    if not keyframes:
+        return 0.5, 0.5
+
+    if len(keyframes) == 1:
+        return keyframes[0]["x"], keyframes[0]["y"]
+
+    if frame_idx <= keyframes[0]["frame"]:
+        return keyframes[0]["x"], keyframes[0]["y"]
+
+    if frame_idx >= keyframes[-1]["frame"]:
+        return keyframes[-1]["x"], keyframes[-1]["y"]
+
+    kf_before = keyframes[0]
+    kf_after = keyframes[-1]
+    for i in range(len(keyframes) - 1):
+        if keyframes[i]["frame"] <= frame_idx <= keyframes[i + 1]["frame"]:
+            kf_before = keyframes[i]
+            kf_after = keyframes[i + 1]
+            break
+
+    span = kf_after["frame"] - kf_before["frame"]
+    if span <= 0:
+        return kf_before["x"], kf_before["y"]
+
+    t = (frame_idx - kf_before["frame"]) / span
+
+    if interp == "ease_in":
+        t = _ease_in(t)
+    elif interp == "ease_out":
+        t = _ease_out(t)
+    elif interp == "ease_in_out":
+        t = _ease_in_out(t)
+
+    x = kf_before["x"] + (kf_after["x"] - kf_before["x"]) * t
+    y = kf_before["y"] + (kf_after["y"] - kf_before["y"]) * t
+    return x, y
+
+
+def _apply_blur_cpu(frame_np, cx, cy, radius, kernel_size):
+    import cv2
+    h, w = frame_np.shape[:2]
+    mask = np.zeros((h, w), dtype=np.float32)
+    cv2.circle(mask, (cx, cy), radius, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=radius * 0.3)
+    mask = np.clip(mask, 0.0, 1.0)
+
+    blurred = cv2.GaussianBlur(frame_np, (kernel_size, kernel_size), 0)
+    mask_3d = mask[:, :, np.newaxis]
+    result = (frame_np.astype(np.float32) * (1.0 - mask_3d) + blurred.astype(np.float32) * mask_3d)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def _apply_blur_gpu(frame_tensor, cx_norm, cy_norm, radius_norm, kernel_size, device):
+    from torchvision.transforms.functional import gaussian_blur as tv_gaussian_blur
+
+    _, h, w = frame_tensor.shape
+    y_grid = torch.arange(h, device=device).float().unsqueeze(1).expand(h, w) / h
+    x_grid = torch.arange(w, device=device).float().unsqueeze(0).expand(h, w) / w
+
+    dist = ((x_grid - cx_norm) ** 2 + (y_grid - cy_norm) ** 2).sqrt()
+    mask = torch.clamp(1.0 - dist / radius_norm, 0.0, 1.0)
+    mask = mask.unsqueeze(0)
+
+    blurred = tv_gaussian_blur(frame_tensor.unsqueeze(0), kernel_size=[kernel_size, kernel_size])[0]
+
+    result = frame_tensor * (1.0 - mask) + blurred * mask
+    return result
+
+
+def _apply_inpaint_cpu(frame_np, cx, cy, radius):
+    import cv2
+    h, w = frame_np.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), radius, 255, -1)
+    result = cv2.inpaint(frame_np, mask, inpaintRadius=radius // 3 + 1, flags=cv2.INPAINT_TELEA)
+    return result
+
+
+def _apply_inpaint_gpu(frame_tensor, cx_norm, cy_norm, radius_norm, device):
+    _, h, w = frame_tensor.shape
+    y_grid = torch.arange(h, device=device).float().unsqueeze(1).expand(h, w) / h
+    x_grid = torch.arange(w, device=device).float().unsqueeze(0).expand(h, w) / w
+
+    dist = ((x_grid - cx_norm) ** 2 + (y_grid - cy_norm) ** 2).sqrt()
+    hard_mask = (dist < radius_norm).float().unsqueeze(0)
+    soft_mask = torch.clamp(1.0 - dist / (radius_norm * 1.3), 0.0, 1.0).unsqueeze(0)
+
+    from torchvision.transforms.functional import gaussian_blur as tv_gaussian_blur
+    result = frame_tensor.clone()
+    for kernel in [31, 61, 91]:
+        k = min(kernel, min(h, w) - 1)
+        if k % 2 == 0:
+            k += 1
+        if k < 3:
+            k = 3
+        filled = tv_gaussian_blur(result.unsqueeze(0), kernel_size=[k, k])[0]
+        result = result * (1.0 - hard_mask) + filled * hard_mask
+
+    result = frame_tensor * (1.0 - soft_mask) + result * soft_mask
+    return result
+
+
+class RizzBlurSpot:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "mode": (BLUR_SPOT_MODES, {
+                    "default": "Blur",
+                    "tooltip": "Blur: Gaussian blur circle. Watermark Removal: inpaint/fill the region."
+                }),
+                "keyframes_json": ("STRING", {
+                    "default": "[]",
+                }),
+                "blur_strength": ("INT", {
+                    "default": 51, "min": 1, "max": 201, "step": 2,
+                    "tooltip": "Gaussian kernel size (must be odd). Higher = stronger blur. (Blur mode only)"
+                }),
+                "blur_size": ("INT", {
+                    "default": 100, "min": 5, "max": 2000, "step": 1,
+                    "tooltip": "Radius of the circle in pixels."
+                }),
+                "interpolation": (BLUR_INTERPOLATIONS, {
+                    "default": "linear",
+                    "tooltip": "How the position transitions between keyframes."
+                }),
+                "processing_mode": (BLUR_PROCESSING_MODES, {
+                    "default": "CPU (OpenCV)",
+                    "tooltip": "CPU uses OpenCV. GPU uses PyTorch/torchvision for faster processing."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "apply_blur"
+    CATEGORY = "RizzNodes/Video"
+
+    def apply_blur(self, video, mode="Blur", keyframes_json="[]", blur_strength=51,
+                   blur_size=100, interpolation="linear",
+                   processing_mode="CPU (OpenCV)"):
+        import cv2
+        import shutil
+
+        video = ensure_video_dict(video)
+        video_path = video["path"]
+        fps = video.get("fps", 24.0)
+        width = video["width"]
+        height = video["height"]
+
+        try:
+            keyframes = json.loads(keyframes_json)
+            if not isinstance(keyframes, list):
+                keyframes = []
+        except (json.JSONDecodeError, TypeError):
+            keyframes = []
+
+        keyframes.sort(key=lambda k: k.get("frame", 0))
+
+        kernel = blur_strength
+        if kernel % 2 == 0:
+            kernel += 1
+        kernel = max(3, min(kernel, 201))
+
+        if not keyframes:
+            print("[RizzNodes BlurSpot] No keyframes defined, returning original video.")
+            return (video,)
+
+        print(f"[RizzNodes BlurSpot] Loaded {len(keyframes)} keyframe(s): {keyframes}")
+        print(f"[RizzNodes BlurSpot] Mode={mode}, blur_size={blur_size}, blur_strength={kernel}, video={width}x{height}")
+
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        frames_dir = tempfile.mkdtemp(prefix="rizz_blur_spot_", dir=temp_dir)
+        output_path = os.path.join(temp_dir, f"rizz_blur_spot_{uuid.uuid4().hex}.mp4")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        use_gpu = processing_mode == "GPU (PyTorch)"
+        device = None
+
+        if use_gpu:
+            try:
+                from torchvision.transforms.functional import gaussian_blur as _tv_check
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                print(f"[RizzNodes BlurSpot] GPU mode on device: {device}")
+            except ImportError:
+                print("[RizzNodes BlurSpot] torchvision not available, falling back to CPU.")
+                use_gpu = False
+
+        is_inpaint = mode == "Watermark Removal"
+        label = "inpainting" if is_inpaint else "blurring"
+        print(f"[RizzNodes BlurSpot] {label.title()} {total_frames} frames ({processing_mode})...")
+
+        for frame_idx in range(total_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            x_norm, y_norm = _interpolate_keyframes(keyframes, frame_idx, total_frames, interpolation)
+            cx = int(x_norm * width)
+            cy = int(y_norm * height)
+
+            if use_gpu:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().to(device) / 255.0
+                radius_norm = blur_size / max(width, height)
+
+                if is_inpaint:
+                    result_tensor = _apply_inpaint_gpu(frame_tensor, x_norm, y_norm, radius_norm, device)
+                else:
+                    result_tensor = _apply_blur_gpu(frame_tensor, x_norm, y_norm, radius_norm, kernel, device)
+
+                result_np = (result_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+                result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+            else:
+                if is_inpaint:
+                    result_bgr = _apply_inpaint_cpu(frame, cx, cy, blur_size)
+                else:
+                    result_bgr = _apply_blur_cpu(frame, cx, cy, blur_size, kernel)
+
+            cv2.imwrite(os.path.join(frames_dir, f"frame_{frame_idx:06d}.png"), result_bgr)
+
+        cap.release()
+
+        has_audio = video.get("has_audio", False)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-start_number", "0",
+            "-i", os.path.join(frames_dir, "frame_%06d.png"),
+        ]
+
+        if has_audio:
+            cmd.extend(["-i", video_path])
+
+        if width % 2 != 0 or height % 2 != 0:
+            cmd.extend(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+
+        if has_audio:
+            cmd.extend(["-map", "0:v", "-map", "1:a"])
+
+        cmd.extend([
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+        ])
+
+        if has_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+        else:
+            cmd.extend(["-an"])
+
+        cmd.append(output_path)
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                print(f"[RizzNodes BlurSpot] FFmpeg error: {result.stderr}")
+                raise RuntimeError(f"FFmpeg failed: {result.stderr[:500]}")
+
+            output_video = get_video_info(output_path)
+            return (output_video,)
+        finally:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+
+
+# ============================================================================
 # Node Mappings
 # ============================================================================
 
@@ -1774,6 +2068,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzExtractAllFrames": RizzExtractAllFrames,
     "RizzFramesToVideoBatch": RizzFramesToVideoBatch,
     "RizzEditClips": RizzEditClips,
+    "RizzBlurSpot": RizzBlurSpot,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1787,4 +2082,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzExtractAllFrames": "🎞️ Extract ALL Frames (Batch)",
     "RizzFramesToVideoBatch": "🎞️ Frames to Video (Batch)",
     "RizzEditClips": "✂️ Edit & Combine Clips (Rizz)",
+    "RizzBlurSpot": "🔵 Blur Spot (Keyframe)",
 }
