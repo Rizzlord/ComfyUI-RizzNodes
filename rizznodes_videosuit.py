@@ -1855,7 +1855,9 @@ def _apply_inpaint_cpu(frame_np, cx, cy, radius):
     h, w = frame_np.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.circle(mask, (cx, cy), radius, 255, -1)
-    result = cv2.inpaint(frame_np, mask, inpaintRadius=radius // 3 + 1, flags=cv2.INPAINT_TELEA)
+    inpaint_r = max(radius, 5)
+    result = cv2.inpaint(frame_np, mask, inpaintRadius=inpaint_r, flags=cv2.INPAINT_NS)
+    result = cv2.inpaint(result, mask, inpaintRadius=inpaint_r // 2 + 1, flags=cv2.INPAINT_NS)
     return result
 
 
@@ -1866,11 +1868,15 @@ def _apply_inpaint_gpu(frame_tensor, cx_norm, cy_norm, radius_norm, device):
 
     dist = ((x_grid - cx_norm) ** 2 + (y_grid - cy_norm) ** 2).sqrt()
     hard_mask = (dist < radius_norm).float().unsqueeze(0)
-    soft_mask = torch.clamp(1.0 - dist / (radius_norm * 1.3), 0.0, 1.0).unsqueeze(0)
+    edge_mask = ((dist >= radius_norm * 0.85) & (dist < radius_norm * 1.15)).float().unsqueeze(0)
+    soft_mask = torch.clamp(1.0 - dist / (radius_norm * 1.1), 0.0, 1.0).unsqueeze(0)
 
     from torchvision.transforms.functional import gaussian_blur as tv_gaussian_blur
-    result = frame_tensor.clone()
-    for kernel in [31, 61, 91]:
+
+    edge_fill = tv_gaussian_blur(frame_tensor.unsqueeze(0), kernel_size=[5, 5])[0]
+    result = frame_tensor * (1.0 - hard_mask) + edge_fill * hard_mask
+
+    for kernel in [15, 31, 51, 71, 101, 151, 201]:
         k = min(kernel, min(h, w) - 1)
         if k % 2 == 0:
             k += 1
