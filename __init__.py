@@ -223,6 +223,19 @@ try:
             video_path = data.get("path", "")
 
             if not video_path:
+                folder = data.get("folder_path", "")
+                fname = data.get("file", "")
+                if folder and fname:
+                    if folder == "RizzVideo":
+                        video_path = os.path.join(fp.get_output_directory(), "RizzVideo", fname)
+                    elif folder == "RizzAudio":
+                        video_path = os.path.join(fp.get_output_directory(), "RizzAudio", fname)
+                    elif os.path.isabs(folder):
+                        video_path = os.path.join(folder, fname)
+                    else:
+                        video_path = os.path.join(fp.get_output_directory(), folder, fname)
+
+            if not video_path:
                 return web.json_response({"error": "no path"}, status=400)
 
             if not os.path.isabs(video_path):
@@ -260,11 +273,17 @@ try:
                 if dur > 0 and fc <= 1:
                     fc = int(dur * fps_val)
 
-            frame_cmd = [
-                "ffmpeg", "-y", "-i", video_path,
+            req_frame = int(data.get("frame", 0))
+            seek_time = req_frame / fps_val if fps_val > 0 else 0
+
+            frame_cmd = ["ffmpeg", "-y"]
+            if seek_time > 0:
+                frame_cmd.extend(["-ss", f"{seek_time:.4f}"])
+            frame_cmd.extend([
+                "-i", video_path,
                 "-vframes", "1", "-f", "image2pipe",
                 "-vcodec", "mjpeg", "-q:v", "5", "pipe:1"
-            ]
+            ])
             result = subprocess.run(frame_cmd, capture_output=True, timeout=10)
             if result.returncode != 0 or not result.stdout:
                 return web.json_response({"error": "frame extraction failed"}, status=500)

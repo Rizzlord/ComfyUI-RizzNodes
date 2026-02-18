@@ -1918,6 +1918,9 @@ class RizzBlurSpot:
                     "default": "CPU (OpenCV)",
                     "tooltip": "CPU uses OpenCV. GPU uses PyTorch/torchvision for faster processing."
                 }),
+            },
+            "optional": {
+                "mask": ("MASK",),
             }
         }
 
@@ -1928,7 +1931,7 @@ class RizzBlurSpot:
 
     def apply_blur(self, video, mode="Blur", keyframes_json="[]", blur_strength=51,
                    blur_size=100, interpolation="linear",
-                   processing_mode="CPU (OpenCV)"):
+                   processing_mode="CPU (OpenCV)", mask=None):
         import cv2
         import shutil
 
@@ -1952,12 +1955,22 @@ class RizzBlurSpot:
             kernel += 1
         kernel = max(3, min(kernel, 201))
 
-        if not keyframes:
-            print("[RizzNodes BlurSpot] No keyframes defined, returning original video.")
+        use_mask = mask is not None and len(mask.shape) >= 2
+        if use_mask:
+            if len(mask.shape) == 4:
+                mask_frames = mask
+            elif len(mask.shape) == 3:
+                mask_frames = mask
+            else:
+                mask_frames = mask.unsqueeze(0)
+            print(f"[RizzNodes BlurSpot] Using connected mask ({mask_frames.shape})")
+        elif not keyframes:
+            print("[RizzNodes BlurSpot] No keyframes and no mask, returning original video.")
             return (video,)
 
-        print(f"[RizzNodes BlurSpot] Loaded {len(keyframes)} keyframe(s): {keyframes}")
         print(f"[RizzNodes BlurSpot] Mode={mode}, blur_size={blur_size}, blur_strength={kernel}, video={width}x{height}")
+        if keyframes and not use_mask:
+            print(f"[RizzNodes BlurSpot] Loaded {len(keyframes)} keyframe(s)")
 
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
@@ -1991,27 +2004,69 @@ class RizzBlurSpot:
             if not ret:
                 break
 
-            x_norm, y_norm = _interpolate_keyframes(keyframes, frame_idx, total_frames, interpolation)
-            cx = int(x_norm * width)
-            cy = int(y_norm * height)
+            if use_mask:
+                midx = min(frame_idx, mask_frames.shape[0] - 1)
+                mask_np = mask_frames[midx].cpu().numpy()
+                mask_np = cv2.resize(mask_np, (width, height), interpolation=cv2.INTER_LINEAR)
 
-            if use_gpu:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().to(device) / 255.0
-                radius_norm = blur_size / max(width, height)
+                if use_gpu:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().to(device) / 255.0
+                    mask_t = torch.from_numpy(mask_np).float().to(device).unsqueeze(0)
 
-                if is_inpaint:
-                    result_tensor = _apply_inpaint_gpu(frame_tensor, x_norm, y_norm, radius_norm, device)
+                    if is_inpaint:
+                        from torchvision.transforms.functional import gaussian_blur as tv_gaussian_blur
+                        hard_mask = (mask_t > 0.5).float()
+                        soft_mask = mask_t
+                        edge_fill = tv_gaussian_blur(frame_tensor.unsqueeze(0), kernel_size=[5, 5])[0]
+                        result = frame_tensor * (1.0 - hard_mask) + edge_fill * hard_mask
+                        for k in [15, 31, 51, 71, 101, 151, 201]:
+                            ks = min(k, min(height, width) - 1)
+                            if ks % 2 == 0: ks += 1
+                            if ks < 3: ks = 3
+                            filled = tv_gaussian_blur(result.unsqueeze(0), kernel_size=[ks, ks])[0]
+                            result = result * (1.0 - hard_mask) + filled * hard_mask
+                        result_tensor = frame_tensor * (1.0 - soft_mask) + result * soft_mask
+                    else:
+                        from torchvision.transforms.functional import gaussian_blur as tv_gaussian_blur
+                        blurred = tv_gaussian_blur(frame_tensor.unsqueeze(0), kernel_size=[kernel, kernel])[0]
+                        result_tensor = frame_tensor * (1.0 - mask_t) + blurred * mask_t
+
+                    result_np = (result_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+                    result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
                 else:
-                    result_tensor = _apply_blur_gpu(frame_tensor, x_norm, y_norm, radius_norm, kernel, device)
-
-                result_np = (result_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-                result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+                    mask_uint8 = (mask_np * 255).astype(np.uint8)
+                    if is_inpaint:
+                        inpaint_r = max(int(np.sum(mask_uint8 > 127) ** 0.5), 5)
+                        result_bgr = cv2.inpaint(frame, mask_uint8, inpaintRadius=inpaint_r, flags=cv2.INPAINT_NS)
+                        result_bgr = cv2.inpaint(result_bgr, mask_uint8, inpaintRadius=inpaint_r // 2 + 1, flags=cv2.INPAINT_NS)
+                    else:
+                        blurred = cv2.GaussianBlur(frame, (kernel, kernel), 0)
+                        mask_3d = mask_np[:, :, np.newaxis].astype(np.float32)
+                        result_bgr = (frame.astype(np.float32) * (1.0 - mask_3d) + blurred.astype(np.float32) * mask_3d)
+                        result_bgr = np.clip(result_bgr, 0, 255).astype(np.uint8)
             else:
-                if is_inpaint:
-                    result_bgr = _apply_inpaint_cpu(frame, cx, cy, blur_size)
+                x_norm, y_norm = _interpolate_keyframes(keyframes, frame_idx, total_frames, interpolation)
+                cx = int(x_norm * width)
+                cy = int(y_norm * height)
+
+                if use_gpu:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().to(device) / 255.0
+                    radius_norm = blur_size / max(width, height)
+
+                    if is_inpaint:
+                        result_tensor = _apply_inpaint_gpu(frame_tensor, x_norm, y_norm, radius_norm, device)
+                    else:
+                        result_tensor = _apply_blur_gpu(frame_tensor, x_norm, y_norm, radius_norm, kernel, device)
+
+                    result_np = (result_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+                    result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
                 else:
-                    result_bgr = _apply_blur_cpu(frame, cx, cy, blur_size, kernel)
+                    if is_inpaint:
+                        result_bgr = _apply_inpaint_cpu(frame, cx, cy, blur_size)
+                    else:
+                        result_bgr = _apply_blur_cpu(frame, cx, cy, blur_size, kernel)
 
             cv2.imwrite(os.path.join(frames_dir, f"frame_{frame_idx:06d}.png"), result_bgr)
 

@@ -129,28 +129,27 @@ app.registerExtension({
             const sourceNode = app.graph.getNodeById(linkInfo.origin_id);
             if (!sourceNode) return null;
 
+            let folderPath = null;
+            let fileName = null;
+            let fullPath = null;
+
             if (sourceNode.widgets) {
                 for (const w of sourceNode.widgets) {
-                    if (w.name === "video_path" || w.name === "path") {
-                        if (typeof w.value === "string" && w.value.length > 2) return w.value;
+                    if (w.name === "folder_path" && typeof w.value === "string") folderPath = w.value;
+                    if (w.name === "file" && typeof w.value === "string" && w.value !== "None") fileName = w.value;
+                    if ((w.name === "video_path" || w.name === "path") && typeof w.value === "string" && w.value.length > 2) {
+                        fullPath = w.value;
                     }
                 }
             }
 
-            const outputSlot = linkInfo.origin_slot;
-            if (sourceNode.outputs && sourceNode.outputs[outputSlot]) {
-                const outputName = sourceNode.outputs[outputSlot].name;
-                if (outputName === "video_path" || outputName === "path") {
-                    if (sourceNode._last_output && typeof sourceNode._last_output === "string") {
-                        return sourceNode._last_output;
-                    }
-                }
-            }
+            if (fullPath) return { path: fullPath };
+            if (folderPath && fileName) return { folder_path: folderPath, file: fileName };
 
             if (sourceNode.widgets_values) {
                 for (const val of sourceNode.widgets_values) {
                     if (typeof val === "string" && /\.(mp4|mkv|mov|webm|avi)$/i.test(val)) {
-                        return val;
+                        return { path: val };
                     }
                 }
             }
@@ -158,7 +157,7 @@ app.registerExtension({
             if (sourceNode.widgets) {
                 for (const w of sourceNode.widgets) {
                     if (typeof w.value === "string" && /\.(mp4|mkv|mov|webm|avi)$/i.test(w.value)) {
-                        return w.value;
+                        return { path: w.value };
                     }
                 }
             }
@@ -166,28 +165,41 @@ app.registerExtension({
             return null;
         };
 
-        const tryLoadPreview = async () => {
+        let _lastVideoInfo = null;
+        let _previewDebounce = null;
+        let _lastPreviewFrame = -1;
+
+        const tryLoadPreview = async (frame = 0) => {
             const videoInput = node.inputs?.find(i => i.name === "video");
             if (!videoInput || !videoInput.link) {
                 previewImage = null;
                 previewLoaded = false;
                 lastVideoPath = null;
+                _lastVideoInfo = null;
                 return;
             }
 
-            const videoPath = resolveVideoPath();
-            if (!videoPath) return;
-            if (videoPath === lastVideoPath && previewLoaded) return;
-            lastVideoPath = videoPath;
+            const videoInfo = resolveVideoPath();
+            if (!videoInfo) return;
+
+            const cacheKey = JSON.stringify(videoInfo) + ":" + frame;
+            if (cacheKey === lastVideoPath && previewLoaded) return;
+            lastVideoPath = cacheKey;
+            _lastVideoInfo = videoInfo;
+            _lastPreviewFrame = frame;
 
             try {
+                const body = { ...videoInfo, frame };
                 const resp = await api.fetchApi("/rizz/video_first_frame", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ path: videoPath })
+                    body: JSON.stringify(body)
                 });
 
-                if (!resp.ok) return;
+                if (!resp.ok) {
+                    console.warn("[RizzBlurSpot] preview fetch failed:", resp.status);
+                    return;
+                }
 
                 const vw = parseInt(resp.headers.get("X-Video-Width")) || 640;
                 const vh = parseInt(resp.headers.get("X-Video-Height")) || 360;
@@ -208,6 +220,13 @@ app.registerExtension({
             } catch (e) {
                 console.warn("[RizzBlurSpot] preview load failed:", e);
             }
+        };
+
+        const fetchFramePreview = (frame) => {
+            if (_previewDebounce) clearTimeout(_previewDebounce);
+            _previewDebounce = setTimeout(() => {
+                tryLoadPreview(frame);
+            }, 250);
         };
 
         const ensureNodeSize = () => {
@@ -468,6 +487,7 @@ app.registerExtension({
             if (isInTimelineArea(mx, my)) {
                 draggingTimeline = true;
                 currentFrame = frameFromTimelineX(mx);
+                fetchFramePreview(currentFrame);
                 node.setDirtyCanvas(true, true);
                 return true;
             }
@@ -503,6 +523,7 @@ app.registerExtension({
 
             if (draggingTimeline) {
                 currentFrame = frameFromTimelineX(mx);
+                fetchFramePreview(currentFrame);
                 node.setDirtyCanvas(true, true);
                 return true;
             }
@@ -533,6 +554,9 @@ app.registerExtension({
         node.onMouseUp = function (e, localPos) {
             if (draggingKf >= 0) {
                 saveKeyframesToWidget();
+            }
+            if (draggingTimeline) {
+                fetchFramePreview(currentFrame);
             }
             draggingKf = -1;
             draggingTimeline = false;
