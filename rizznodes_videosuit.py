@@ -1485,6 +1485,10 @@ class RizzEditClips:
                     "default": False,
                     "tooltip": "Enable frame interpolation and advanced processing for smooth framerate conversion. (Slower)"
                 }),
+                "zoom_in": ("FLOAT", {
+                    "default": 1.0, "min": 1.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Zoom factor into the center of the video. 1.0 = no zoom, 2.0 = 2x zoom, etc."
+                }),
             },
             "optional": {}
         }
@@ -1507,7 +1511,7 @@ class RizzEditClips:
     FUNCTION = "edit_clips"
     CATEGORY = "RizzNodes/Video"
     
-    def edit_clips(self, video_count, trim_start=0.0, trim_end=0.0, process_clips=False, **kwargs):
+    def edit_clips(self, video_count, trim_start=0.0, trim_end=0.0, process_clips=False, zoom_in=1.0, **kwargs):
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
         output_path = os.path.join(temp_dir, f"rizz_edit_{uuid.uuid4().hex}.mp4")
@@ -1728,6 +1732,19 @@ class RizzEditClips:
                     current_a = f"[{out_concat_a}]"
                     
                 accumulated_duration += next_dur
+
+        if zoom_in > 1.0:
+            crop_w = int(width / zoom_in)
+            crop_h = int(height / zoom_in)
+            if crop_w % 2 != 0:
+                crop_w -= 1
+            if crop_h % 2 != 0:
+                crop_h -= 1
+            crop_x = (width - crop_w) // 2
+            crop_y = (height - crop_h) // 2
+            zoom_filter = f"{current_v}crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={width}:{height}:flags=lanczos[zoomed]"
+            filter_complex.append(zoom_filter)
+            current_v = "[zoomed]"
 
         # Final mapping
         cmd.extend(['-filter_complex', ";".join(filter_complex)])

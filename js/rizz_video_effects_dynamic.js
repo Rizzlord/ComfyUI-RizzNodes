@@ -54,7 +54,7 @@ function setupEditClips(node) {
         hideCountWidget();
 
         // Cache fixed widgets
-        const fixedNames = ["trim_start", "trim_end", "process_clips"];
+        const fixedNames = ["trim_start", "trim_end", "process_clips", "zoom_in"];
         for (const name of fixedNames) {
             const w = allWidgets.find(w => w.name === name);
             if (w) node.cachedWidgets.fixed.push(w);
