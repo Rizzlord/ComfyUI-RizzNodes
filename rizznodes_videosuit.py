@@ -1764,7 +1764,7 @@ class RizzEditClips:
 # ============================================================================
 
 BLUR_INTERPOLATIONS = ["linear", "ease_in", "ease_out", "ease_in_out"]
-BLUR_PROCESSING_MODES = ["CPU (OpenCV)", "GPU (PyTorch)"]
+BLUR_PROCESSING_MODES = ["CPU (OpenCV)", "GPU (PyTorch)", "AI (LaMa)"]
 BLUR_SPOT_MODES = ["Blur", "Watermark Removal"]
 
 
@@ -1889,6 +1889,22 @@ def _apply_inpaint_gpu(frame_tensor, cx_norm, cy_norm, radius_norm, device):
     return result
 
 
+def _apply_inpaint_lama(frame_bgr, mask_uint8, lama_model, strength=1.0):
+    import cv2
+    from PIL import Image
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(frame_rgb)
+    mask_pil = Image.fromarray(mask_uint8).convert("L")
+    result_pil = lama_model(img_pil, mask_pil)
+    result_rgb = np.array(result_pil)
+    result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+    if strength < 1.0:
+        alpha = strength
+        result_bgr = (frame_bgr.astype(np.float32) * (1.0 - alpha) + result_bgr.astype(np.float32) * alpha)
+        result_bgr = np.clip(result_bgr, 0, 255).astype(np.uint8)
+    return result_bgr
+
+
 class RizzBlurSpot:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1904,7 +1920,7 @@ class RizzBlurSpot:
                 }),
                 "blur_strength": ("INT", {
                     "default": 51, "min": 1, "max": 201, "step": 2,
-                    "tooltip": "Gaussian kernel size (must be odd). Higher = stronger blur. (Blur mode only)"
+                    "tooltip": "Blur mode: Gaussian kernel size. AI (LaMa) Watermark Removal: strength 1-100 (% blend)."
                 }),
                 "blur_size": ("INT", {
                     "default": 100, "min": 5, "max": 2000, "step": 1,
@@ -1984,9 +2000,20 @@ class RizzBlurSpot:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         use_gpu = processing_mode == "GPU (PyTorch)"
+        use_lama = processing_mode == "AI (LaMa)"
         device = None
+        lama_model = None
 
-        if use_gpu:
+        if use_lama:
+            try:
+                from simple_lama_inpainting import SimpleLama
+                lama_model = SimpleLama()
+                print("[RizzNodes BlurSpot] AI (LaMa) model loaded")
+            except ImportError:
+                print("[RizzNodes BlurSpot] simple-lama-inpainting not installed. Install with: pip install simple-lama-inpainting")
+                print("[RizzNodes BlurSpot] Falling back to CPU (OpenCV).")
+                use_lama = False
+        elif use_gpu:
             try:
                 from torchvision.transforms.functional import gaussian_blur as _tv_check
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2008,8 +2035,12 @@ class RizzBlurSpot:
                 midx = min(frame_idx, mask_frames.shape[0] - 1)
                 mask_np = mask_frames[midx].cpu().numpy()
                 mask_np = cv2.resize(mask_np, (width, height), interpolation=cv2.INTER_LINEAR)
+                mask_uint8 = (np.clip(mask_np, 0, 1) * 255).astype(np.uint8)
 
-                if use_gpu:
+                if use_lama and is_inpaint:
+                    lama_strength = min(max(blur_strength, 1), 100) / 100.0
+                    result_bgr = _apply_inpaint_lama(frame, mask_uint8, lama_model, lama_strength)
+                elif use_gpu:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().to(device) / 255.0
                     mask_t = torch.from_numpy(mask_np).float().to(device).unsqueeze(0)
@@ -2035,7 +2066,6 @@ class RizzBlurSpot:
                     result_np = (result_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
                     result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
                 else:
-                    mask_uint8 = (mask_np * 255).astype(np.uint8)
                     if is_inpaint:
                         inpaint_r = max(int(np.sum(mask_uint8 > 127) ** 0.5), 5)
                         result_bgr = cv2.inpaint(frame, mask_uint8, inpaintRadius=inpaint_r, flags=cv2.INPAINT_NS)
@@ -2050,7 +2080,12 @@ class RizzBlurSpot:
                 cx = int(x_norm * width)
                 cy = int(y_norm * height)
 
-                if use_gpu:
+                if use_lama and is_inpaint:
+                    circle_mask = np.zeros((height, width), dtype=np.uint8)
+                    cv2.circle(circle_mask, (cx, cy), blur_size, 255, -1)
+                    lama_strength = min(max(blur_strength, 1), 100) / 100.0
+                    result_bgr = _apply_inpaint_lama(frame, circle_mask, lama_model, lama_strength)
+                elif use_gpu:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().to(device) / 255.0
                     radius_norm = blur_size / max(width, height)
