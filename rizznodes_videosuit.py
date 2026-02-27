@@ -1810,6 +1810,10 @@ class RizzTimelineEditor:
                     "default": True,
                     "tooltip": "Include audio from placed video clips if present.",
                 }),
+                "end_with_last_clip": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "If true, output extends to include the last placed clip. If false, output uses timeline length and clips past it are cut.",
+                }),
                 "master_volume": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05,
                     "tooltip": "Final mix output gain.",
@@ -1964,7 +1968,7 @@ class RizzTimelineEditor:
         }
 
     def render_timeline(self, timeline_json, output_width=1280, output_height=720, output_fps=30.0,
-                        include_video_audio=True, master_volume=1.0, **kwargs):
+                        include_video_audio=True, end_with_last_clip=True, master_volume=1.0, **kwargs):
         output_width = int(max(64, output_width))
         output_height = int(max(64, output_height))
         output_fps = max(1.0, float(output_fps))
@@ -2052,7 +2056,13 @@ class RizzTimelineEditor:
             for c in audio_clips:
                 max_end = max(max_end, c["start"] + c["dur"])
 
-            timeline_length = max(timeline["timeline_length"], max_end)
+            requested_timeline_length = max(0.0, timeline["timeline_length"])
+            if end_with_last_clip:
+                # End exactly at the furthest clip boundary.
+                # Fallback to requested timeline length when no clips are placed.
+                timeline_length = max_end if max_end > 0.0 else requested_timeline_length
+            else:
+                timeline_length = requested_timeline_length
             if timeline_length <= 0.0:
                 if video_sources:
                     timeline_length = max(self._safe_float(v.get("duration", 0.0), 0.0) for v in video_sources.values())
