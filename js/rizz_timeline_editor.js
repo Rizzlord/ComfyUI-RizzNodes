@@ -11,6 +11,22 @@ const DEFAULT_CLIP_SEC = 3.0;
 const MIN_TIMELINE_SEC = 6.0;
 const SNAP_THRESHOLD_PX = 10;
 const HIDDEN_WIDGET = "hidden";
+const TRIM_HANDLE_W = 5;
+const TRIM_HANDLE_PAD = 2;
+const TRANSITION_TYPES = [
+    "Fade",
+    "Smooth",
+    "Dissolve",
+    "Dip Black",
+    "Dip White",
+    "Slide Left",
+    "Slide Right",
+    "Wipe Left",
+    "Wipe Right",
+    "Zoom In",
+    "Zoom Out",
+];
+const TRANSITION_TARGETS = ["In+Out", "In Only", "Out Only", "Clear"];
 
 const COLORS = {
     panelBg: "rgba(20,22,28,0.96)",
@@ -92,6 +108,15 @@ app.registerExtension({
         const getWidget = (name) => {
             if (!Array.isArray(node.widgets)) return null;
             return node.widgets.find((w) => w?.name === name) || null;
+        };
+
+        const normalizeTransition = (raw) => {
+            if (!raw || typeof raw !== "object") return null;
+            const type = `${raw.type || "None"}`.trim();
+            const duration = Math.max(0, toNum(raw.duration, 0));
+            if (type === "None" || duration <= 0) return null;
+            if (!TRANSITION_TYPES.includes(type)) return null;
+            return { type, duration };
         };
 
         const state = {
@@ -180,6 +205,8 @@ app.registerExtension({
                 in: trimIn,
                 dur,
                 volume: vol,
+                transition_in: normalizeTransition(raw.transition_in),
+                transition_out: normalizeTransition(raw.transition_out),
                 enabled: true,
             };
         };
@@ -239,6 +266,8 @@ app.registerExtension({
                     in: c.in,
                     dur: c.dur,
                     volume: c.volume,
+                    transition_in: c.transition_in || null,
+                    transition_out: c.transition_out || null,
                     enabled: true,
                 })),
                 audio_clips: state.audioClips.map((c) => ({
@@ -249,11 +278,117 @@ app.registerExtension({
                     in: c.in,
                     dur: c.dur,
                     volume: c.volume,
+                    transition_in: c.transition_in || null,
+                    transition_out: c.transition_out || null,
                     enabled: true,
                 })),
             };
             w.value = JSON.stringify(payload);
             node.setDirtyCanvas(true, true);
+        };
+
+        const getTransitionType = () => {
+            const w = getWidget("transition_type");
+            const value = `${w?.value || "Fade"}`;
+            return TRANSITION_TYPES.includes(value) ? value : "Fade";
+        };
+
+        const getTransitionTarget = () => {
+            const w = getWidget("transition_target");
+            const value = `${w?.value || "In+Out"}`;
+            return TRANSITION_TARGETS.includes(value) ? value : "In+Out";
+        };
+
+        const getTransitionDuration = () => {
+            const w = getWidget("transition_duration");
+            return Math.max(0.05, toNum(w?.value, 0.25));
+        };
+
+        const resolveTransitionTargetClip = () => {
+            let clip = getSelectedClip();
+            if (clip) return clip;
+
+            const found = findClipAtPlayhead();
+            if (found) {
+                selectClip(found.media, found.clip.id);
+                return found.clip;
+            }
+
+            const fallback = state.videoClips[0] ? { clip: state.videoClips[0], media: "video" }
+                : (state.audioClips[0] ? { clip: state.audioClips[0], media: "audio" } : null);
+            if (!fallback) return null;
+            selectClip(fallback.media, fallback.clip.id);
+            return fallback.clip;
+        };
+
+        const clearSelectedTransition = () => {
+            const clip = resolveTransitionTargetClip();
+            if (!clip) return;
+            clip.transition_in = null;
+            clip.transition_out = null;
+            saveToWidget();
+        };
+
+        const applySelectedTransition = () => {
+            const clip = resolveTransitionTargetClip();
+            if (!clip) return;
+
+            const target = getTransitionTarget();
+            if (target === "Clear") {
+                clearSelectedTransition();
+                return;
+            }
+
+            const duration = Math.max(0.01, Math.min(getTransitionDuration(), Math.max(0.01, clip.dur * 0.49)));
+            const transition = { type: getTransitionType(), duration };
+
+            if (target === "In+Out" || target === "In Only") {
+                clip.transition_in = { ...transition };
+            }
+            if (target === "In+Out" || target === "Out Only") {
+                clip.transition_out = { ...transition };
+            }
+            saveToWidget();
+        };
+
+        const ensureTransitionControls = () => {
+            let wType = getWidget("transition_type");
+            if (!wType) {
+                wType = node.addWidget("combo", "transition_type", "Fade", () => {}, { values: TRANSITION_TYPES });
+            }
+
+            let wTarget = getWidget("transition_target");
+            if (!wTarget) {
+                wTarget = node.addWidget("combo", "transition_target", "In+Out", () => {}, { values: TRANSITION_TARGETS });
+            }
+
+            let wDuration = getWidget("transition_duration");
+            if (!wDuration) {
+                wDuration = node.addWidget("number", "transition_duration", 0.25, () => {}, {
+                    min: 0.05,
+                    max: 3.0,
+                    step: 0.05,
+                    precision: 2,
+                });
+            }
+
+            let wApply = getWidget("add_transition");
+            if (!wApply) {
+                wApply = node.addWidget("button", "add_transition", null, () => {
+                    applySelectedTransition();
+                });
+            }
+
+            let wClear = getWidget("clear_transition");
+            if (!wClear) {
+                wClear = node.addWidget("button", "clear_transition", null, () => {
+                    clearSelectedTransition();
+                });
+            }
+
+            if (wType) wType.value = `${wType.value || "Fade"}`;
+            if (wTarget) wTarget.value = `${wTarget.value || "In+Out"}`;
+            if (wDuration) wDuration.value = Math.max(0.05, toNum(wDuration.value, 0.25));
         };
 
         const getTrackInfoFromRow = (row) => {
@@ -333,6 +468,28 @@ app.registerExtension({
             return findClip(selected.media, selected.id);
         };
 
+        const findClipAtPlayhead = () => {
+            const t = state.playhead;
+            const candidates = [];
+            const pushFrom = (arr, media) => {
+                for (const c of arr) {
+                    const end = c.start + c.dur;
+                    if (t >= c.start && t <= end) {
+                        candidates.push({ clip: c, media });
+                    }
+                }
+            };
+            pushFrom(state.videoClips, "video");
+            pushFrom(state.audioClips, "audio");
+            if (candidates.length === 0) return null;
+            candidates.sort((a, b) => {
+                if (a.media !== b.media) return a.media === "video" ? -1 : 1;
+                if (a.clip.track !== b.clip.track) return b.clip.track - a.clip.track;
+                return b.clip.start - a.clip.start;
+            });
+            return candidates[0];
+        };
+
         const selectClip = (media, id) => {
             selected.media = media;
             selected.id = id;
@@ -385,6 +542,8 @@ app.registerExtension({
                 in: 0,
                 dur: DEFAULT_CLIP_SEC,
                 volume: 1.0,
+                transition_in: null,
+                transition_out: null,
                 enabled: true,
             };
             if (media === "video") state.videoClips.push(clip);
@@ -428,6 +587,8 @@ app.registerExtension({
                         in: 0,
                         dur: DEFAULT_CLIP_SEC,
                         volume: 1.0,
+                        transition_in: null,
+                        transition_out: null,
                         enabled: true,
                     });
                     changed = true;
@@ -444,6 +605,8 @@ app.registerExtension({
                         in: 0,
                         dur: DEFAULT_CLIP_SEC,
                         volume: 1.0,
+                        transition_in: null,
+                        transition_out: null,
                         enabled: true,
                     });
                     changed = true;
@@ -654,7 +817,7 @@ app.registerExtension({
             for (let i = uiCache.clipRects.length - 1; i >= 0; i--) {
                 const r = uiCache.clipRects[i];
                 if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
-                    const edgePad = 8;
+                    const edgePad = Math.max(10, TRIM_HANDLE_W + TRIM_HANDLE_PAD + 3);
                     let zone = "body";
                     if (mx <= r.x + edgePad) zone = "left";
                     else if (mx >= r.x + r.w - edgePad) zone = "right";
@@ -789,6 +952,7 @@ app.registerExtension({
                 ctx.fillText(info?.label || "", layout.left + layout.labelW * 0.5, y + layout.trackH * 0.5);
             }
 
+            const pxPerSec = layout.timeWidth / Math.max(getDuration(), 0.0001);
             for (const r of uiCache.clipRects) {
                 const isSel = selected.media === r.media && selected.id === r.clip.id;
                 const fill = isSel ? COLORS.clipSel : (r.media === "video" ? COLORS.clipVideo : COLORS.clipAudio);
@@ -798,6 +962,25 @@ app.registerExtension({
                 ctx.strokeStyle = isSel ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.32)";
                 ctx.lineWidth = isSel ? 1.8 : 1;
                 ctx.stroke();
+
+                // Visual trim grabbers at start/end
+                ctx.fillStyle = "rgba(10,12,16,0.75)";
+                ctx.fillRect(r.x + TRIM_HANDLE_PAD, r.y + 1, TRIM_HANDLE_W, r.h - 2);
+                ctx.fillRect(r.x + r.w - TRIM_HANDLE_W - TRIM_HANDLE_PAD, r.y + 1, TRIM_HANDLE_W, r.h - 2);
+
+                const tIn = r.clip.transition_in;
+                if (tIn?.duration > 0) {
+                    const tw = Math.min(r.w * 0.48, Math.max(3, tIn.duration * pxPerSec));
+                    ctx.fillStyle = "rgba(255,255,255,0.22)";
+                    ctx.fillRect(r.x + 1, r.y + 1, tw, Math.min(8, r.h - 2));
+                }
+
+                const tOut = r.clip.transition_out;
+                if (tOut?.duration > 0) {
+                    const tw = Math.min(r.w * 0.48, Math.max(3, tOut.duration * pxPerSec));
+                    ctx.fillStyle = "rgba(255,255,255,0.22)";
+                    ctx.fillRect(r.x + r.w - tw - 1, r.y + 1, tw, Math.min(8, r.h - 2));
+                }
 
                 ctx.fillStyle = "rgba(18,18,22,0.92)";
                 ctx.font = "bold 10px sans-serif";
@@ -843,7 +1026,7 @@ app.registerExtension({
             ctx.font = "10px sans-serif";
             ctx.textAlign = "left";
             ctx.textBaseline = "alphabetic";
-            ctx.fillText("Drag clips to move, edges to resize, magnetic snap enabled, C=cut, Del=delete, 1-3=source", layout.left + 4, layout.top + layout.height - 4);
+            ctx.fillText("Drag edge grabbers to trim, magnetic snap enabled, C=cut, Del=delete, transitions via widgets above", layout.left + 4, layout.top + layout.height - 4);
         };
 
         const startDrag = (mode, data = {}) => {
@@ -854,6 +1037,13 @@ app.registerExtension({
         const stopDrag = () => {
             drag = null;
             snapGuideTime = null;
+        };
+
+        const isPrimaryButtonPressed = (e) => {
+            if (!e) return true;
+            if (typeof e.buttons === "number") return (e.buttons & 1) === 1;
+            if (typeof e.which === "number") return e.which === 1;
+            return true;
         };
 
         const origOnDrawForeground = node.onDrawForeground;
@@ -920,6 +1110,12 @@ app.registerExtension({
             if (!drag) {
                 if (origOnMouseMove) return origOnMouseMove.apply(this, arguments);
                 return false;
+            }
+
+            if (!isPrimaryButtonPressed(e)) {
+                stopDrag();
+                node.setDirtyCanvas(true, true);
+                return true;
             }
 
             if (drag.mode === "scrub") {
@@ -1043,10 +1239,21 @@ app.registerExtension({
         };
 
         window.addEventListener("keydown", keyHandler, true);
+        const forceStopDrag = () => {
+            if (!drag) return;
+            stopDrag();
+            node.setDirtyCanvas(true, true);
+        };
+        window.addEventListener("mouseup", forceStopDrag, true);
+        window.addEventListener("pointerup", forceStopDrag, true);
+        window.addEventListener("blur", forceStopDrag, true);
 
         const origOnRemoved = node.onRemoved;
         node.onRemoved = function () {
             window.removeEventListener("keydown", keyHandler, true);
+            window.removeEventListener("mouseup", forceStopDrag, true);
+            window.removeEventListener("pointerup", forceStopDrag, true);
+            window.removeEventListener("blur", forceStopDrag, true);
             if (origOnRemoved) return origOnRemoved.apply(this, arguments);
             return undefined;
         };
@@ -1054,6 +1261,7 @@ app.registerExtension({
         const origOnConfigure = node.onConfigure;
         node.onConfigure = function () {
             if (origOnConfigure) origOnConfigure.apply(this, arguments);
+            ensureTransitionControls();
             loadFromWidget();
             hideTimelineWidget();
             ensureNodeSize();
@@ -1070,6 +1278,7 @@ app.registerExtension({
         };
 
         setTimeout(() => {
+            ensureTransitionControls();
             loadFromWidget();
             hideTimelineWidget();
             ensureNodeSize();

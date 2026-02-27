@@ -1886,6 +1886,22 @@ class RizzTimelineEditor:
             if not isinstance(raw_list, list):
                 return out
 
+            def _normalize_transition(raw_t):
+                if not isinstance(raw_t, dict):
+                    return None
+                t_type = str(raw_t.get("type", "None")).strip()
+                t_dur = max(0.0, self._safe_float(raw_t.get("duration", 0.0), 0.0))
+                if t_type == "None" or t_dur <= 0.0:
+                    return None
+                # Keep transition types explicit to avoid unexpected ffmpeg chains.
+                if t_type not in {
+                    "Fade", "Smooth", "Dissolve", "Dip Black", "Dip White",
+                    "Slide Left", "Slide Right", "Wipe Left", "Wipe Right",
+                    "Zoom In", "Zoom Out"
+                }:
+                    return None
+                return {"type": t_type, "duration": t_dur}
+
             for idx, raw in enumerate(raw_list):
                 if not isinstance(raw, dict):
                     continue
@@ -1914,6 +1930,8 @@ class RizzTimelineEditor:
                     "in": trim_in,
                     "dur": dur,
                     "volume": volume,
+                    "transition_in": _normalize_transition(raw.get("transition_in")),
+                    "transition_out": _normalize_transition(raw.get("transition_out")),
                 })
             return out
 
@@ -2023,9 +2041,25 @@ class RizzTimelineEditor:
                 if clip_dur < 0.05:
                     continue
 
+                t_in = clip.get("transition_in")
+                t_out = clip.get("transition_out")
+                max_each = max(0.0, clip_dur * 0.49)
+                if isinstance(t_in, dict):
+                    d = min(max_each, max(0.0, self._safe_float(t_in.get("duration", 0.0), 0.0)))
+                    t_in = {"type": t_in.get("type", "Fade"), "duration": d} if d > 0.0 else None
+                else:
+                    t_in = None
+                if isinstance(t_out, dict):
+                    d = min(max_each, max(0.0, self._safe_float(t_out.get("duration", 0.0), 0.0)))
+                    t_out = {"type": t_out.get("type", "Fade"), "duration": d} if d > 0.0 else None
+                else:
+                    t_out = None
+
                 video_clips.append({
                     **clip,
                     "dur": clip_dur,
+                    "transition_in": t_in,
+                    "transition_out": t_out,
                 })
 
             audio_clips = []
@@ -2045,9 +2079,25 @@ class RizzTimelineEditor:
                 if clip_dur < 0.05:
                     continue
 
+                t_in = clip.get("transition_in")
+                t_out = clip.get("transition_out")
+                max_each = max(0.0, clip_dur * 0.49)
+                if isinstance(t_in, dict):
+                    d = min(max_each, max(0.0, self._safe_float(t_in.get("duration", 0.0), 0.0)))
+                    t_in = {"type": t_in.get("type", "Fade"), "duration": d} if d > 0.0 else None
+                else:
+                    t_in = None
+                if isinstance(t_out, dict):
+                    d = min(max_each, max(0.0, self._safe_float(t_out.get("duration", 0.0), 0.0)))
+                    t_out = {"type": t_out.get("type", "Fade"), "duration": d} if d > 0.0 else None
+                else:
+                    t_out = None
+
                 audio_clips.append({
                     **clip,
                     "dur": clip_dur,
+                    "transition_in": t_in,
+                    "transition_out": t_out,
                 })
 
             max_end = 0.0
@@ -2127,6 +2177,19 @@ class RizzTimelineEditor:
             current_v = "vbase0"
             frame_pad = 1.0 / output_fps if output_fps > 0 else 0.0
 
+            def _slide_expr(direction, start_time, duration, is_out):
+                start_s = self._fmt_num(start_time)
+                dur_s = self._fmt_num(max(duration, 1e-6))
+                prog = f"min(max((t-{start_s})/{dur_s},0),1)"
+                if not is_out:
+                    if direction == "left":
+                        return f"({output_width}*(1-{prog}))"
+                    return f"(-{output_width}*(1-{prog}))"
+                else:
+                    if direction == "left":
+                        return f"(-{output_width}*{prog})"
+                    return f"({output_width}*{prog})"
+
             for idx, clip in enumerate(video_clips):
                 src_idx = video_input_index[clip["src"]]
                 clip_label = f"vclip{idx}"
@@ -2136,16 +2199,61 @@ class RizzTimelineEditor:
                 dur_s = self._fmt_num(clip["dur"])
                 in_s = self._fmt_num(clip["in"])
                 frame_pad_s = self._fmt_num(frame_pad)
+                v_chain = [
+                    f"trim=start={in_s}:duration={dur_s}",
+                    "setpts=PTS-STARTPTS",
+                    f"fps={self._fmt_num(output_fps)}",
+                    f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease",
+                    f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:color=black",
+                    "format=rgba",
+                ]
 
-                filters.append(
-                    f"[{src_idx}:v]trim=start={in_s}:duration={dur_s},setpts=PTS-STARTPTS,"
-                    f"fps={self._fmt_num(output_fps)},"
-                    f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,"
-                    f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                    f"format=rgba,tpad=stop_mode=clone:stop_duration={frame_pad_s},"
-                    f"setpts=PTS+{start_s}/TB[{clip_label}]"
-                )
-                filters.append(f"[{current_v}][{clip_label}]overlay=shortest=0:eof_action=pass[{out_label}]")
+                t_in = clip.get("transition_in")
+                t_out = clip.get("transition_out")
+                fade_like_types = {"Fade", "Smooth", "Dissolve", "Dip Black", "Dip White", "Wipe Left", "Wipe Right", "Zoom In", "Zoom Out"}
+                if isinstance(t_in, dict) and t_in.get("type") in fade_like_types:
+                    d = max(0.0, self._safe_float(t_in.get("duration", 0.0), 0.0))
+                    if d > 0.0:
+                        v_chain.append(f"fade=t=in:st=0:d={self._fmt_num(d)}:alpha=1")
+                if isinstance(t_out, dict) and t_out.get("type") in fade_like_types:
+                    d = max(0.0, self._safe_float(t_out.get("duration", 0.0), 0.0))
+                    if d > 0.0:
+                        st = max(0.0, clip["dur"] - d)
+                        v_chain.append(f"fade=t=out:st={self._fmt_num(st)}:d={self._fmt_num(d)}:alpha=1")
+
+                v_chain.append(f"tpad=stop_mode=clone:stop_duration={frame_pad_s}")
+                v_chain.append(f"setpts=PTS+{start_s}/TB")
+
+                filters.append(f"[{src_idx}:v]{','.join(v_chain)}[{clip_label}]")
+
+                x_expr = "0"
+                in_expr = None
+                out_expr = None
+                in_end = None
+                out_start = None
+
+                if isinstance(t_in, dict) and t_in.get("type") in {"Slide Left", "Slide Right"}:
+                    d = max(0.0, self._safe_float(t_in.get("duration", 0.0), 0.0))
+                    if d > 0.0:
+                        direction = "left" if t_in.get("type") == "Slide Left" else "right"
+                        in_expr = _slide_expr(direction, clip["start"], d, False)
+                        in_end = clip["start"] + d
+
+                if isinstance(t_out, dict) and t_out.get("type") in {"Slide Left", "Slide Right"}:
+                    d = max(0.0, self._safe_float(t_out.get("duration", 0.0), 0.0))
+                    if d > 0.0:
+                        direction = "left" if t_out.get("type") == "Slide Left" else "right"
+                        out_start = max(clip["start"], clip["start"] + clip["dur"] - d)
+                        out_expr = _slide_expr(direction, out_start, d, True)
+
+                if in_expr is not None and out_expr is not None:
+                    x_expr = f"if(lt(t,{self._fmt_num(in_end)}),{in_expr},if(gte(t,{self._fmt_num(out_start)}),{out_expr},0))"
+                elif in_expr is not None:
+                    x_expr = f"if(lt(t,{self._fmt_num(in_end)}),{in_expr},0)"
+                elif out_expr is not None:
+                    x_expr = f"if(gte(t,{self._fmt_num(out_start)}),{out_expr},0)"
+
+                filters.append(f"[{current_v}][{clip_label}]overlay=x='{x_expr}':y=0:shortest=0:eof_action=pass[{out_label}]")
                 current_v = out_label
 
             filters.append(
@@ -2169,12 +2277,25 @@ class RizzTimelineEditor:
                     in_s = self._fmt_num(clip["in"])
                     vol_s = self._fmt_num(clip["volume"])
                     delay_ms = max(0, int(round(clip["start"] * 1000.0)))
-
-                    filters.append(
-                        f"[{src_idx}:a]atrim=start={in_s}:duration={dur_s},asetpts=PTS-STARTPTS,"
-                        f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
-                        f"volume={vol_s},adelay={delay_ms}|{delay_ms}[{label}]"
-                    )
+                    a_chain = [
+                        f"atrim=start={in_s}:duration={dur_s}",
+                        "asetpts=PTS-STARTPTS",
+                        "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+                    ]
+                    t_in = clip.get("transition_in")
+                    t_out = clip.get("transition_out")
+                    if isinstance(t_in, dict):
+                        d = max(0.0, self._safe_float(t_in.get("duration", 0.0), 0.0))
+                        if d > 0.0:
+                            a_chain.append(f"afade=t=in:st=0:d={self._fmt_num(d)}")
+                    if isinstance(t_out, dict):
+                        d = max(0.0, self._safe_float(t_out.get("duration", 0.0), 0.0))
+                        if d > 0.0:
+                            st = max(0.0, clip["dur"] - d)
+                            a_chain.append(f"afade=t=out:st={self._fmt_num(st)}:d={self._fmt_num(d)}")
+                    a_chain.append(f"volume={vol_s}")
+                    a_chain.append(f"adelay={delay_ms}|{delay_ms}")
+                    filters.append(f"[{src_idx}:a]{','.join(a_chain)}[{label}]")
                     audio_labels.append(f"[{label}]")
 
             for idx, clip in enumerate(audio_clips):
@@ -2185,12 +2306,25 @@ class RizzTimelineEditor:
                 in_s = self._fmt_num(clip["in"])
                 vol_s = self._fmt_num(clip["volume"])
                 delay_ms = max(0, int(round(clip["start"] * 1000.0)))
-
-                filters.append(
-                    f"[{src_idx}:a]atrim=start={in_s}:duration={dur_s},asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
-                    f"volume={vol_s},adelay={delay_ms}|{delay_ms}[{label}]"
-                )
+                a_chain = [
+                    f"atrim=start={in_s}:duration={dur_s}",
+                    "asetpts=PTS-STARTPTS",
+                    "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+                ]
+                t_in = clip.get("transition_in")
+                t_out = clip.get("transition_out")
+                if isinstance(t_in, dict):
+                    d = max(0.0, self._safe_float(t_in.get("duration", 0.0), 0.0))
+                    if d > 0.0:
+                        a_chain.append(f"afade=t=in:st=0:d={self._fmt_num(d)}")
+                if isinstance(t_out, dict):
+                    d = max(0.0, self._safe_float(t_out.get("duration", 0.0), 0.0))
+                    if d > 0.0:
+                        st = max(0.0, clip["dur"] - d)
+                        a_chain.append(f"afade=t=out:st={self._fmt_num(st)}:d={self._fmt_num(d)}")
+                a_chain.append(f"volume={vol_s}")
+                a_chain.append(f"adelay={delay_ms}|{delay_ms}")
+                filters.append(f"[{src_idx}:a]{','.join(a_chain)}[{label}]")
                 audio_labels.append(f"[{label}]")
 
             has_audio_output = len(audio_labels) > 0
