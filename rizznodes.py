@@ -87,6 +87,134 @@ def hsv_to_rgb(arr):
     mask = i == 5
     r[mask], g[mask], b[mask] = v[mask], p[mask], q[mask]
     return np.stack([r, g, b], axis=-1)
+
+
+GIMP_LOWEST_TEMPERATURE = 1000.0
+GIMP_HIGHEST_TEMPERATURE = 12000.0
+
+# GEGL/GIMP coefficients for Planckian locus approximation in linear RGB space.
+GIMP_RGB_R55 = np.array([
+    [
+        6.9389923563552169e-01,  2.7719388100974670e+03,
+        2.0999316761104289e+07, -4.8889434162208414e+09,
+       -1.1899785506796783e+07, -4.7418427686099203e+04,
+        1.0000000000000000e+00,  3.5434394338546258e+03,
+       -5.6159353379127791e+05,  2.7369467137870544e+08,
+        1.6295814912940913e+08,  4.3975072422421846e+05
+    ],
+    [
+        9.5417426141210926e-01,  2.2041043287098860e+03,
+       -3.0142332673634286e+06, -3.5111986367681120e+03,
+       -5.7030969525354260e+00,  6.1810926909962016e-01,
+        1.0000000000000000e+00,  1.3728609973644000e+03,
+        1.3099184987576159e+06, -2.1757404458816318e+03,
+       -2.3892456292510311e+00,  8.1079012401293249e-01
+    ],
+    [
+       -7.1151622540856201e+10,  3.3728185802339764e+16,
+       -7.9396187338868539e+19,  2.9699115135330123e+22,
+       -9.7520399221734228e+22, -2.9250107732225114e+20,
+        1.0000000000000000e+00,  1.3888666482167408e+16,
+        2.3899765140914549e+19,  1.4583606312383295e+23,
+        1.9766018324502894e+22,  2.9395068478016189e+18
+    ]
+], dtype=np.float64)
+
+
+def kelvin_to_rgb(kelvin):
+    temperature = float(np.clip(kelvin, GIMP_LOWEST_TEMPERATURE, GIMP_HIGHEST_TEMPERATURE))
+    rgb = np.empty(3, dtype=np.float64)
+
+    for channel in range(3):
+        coeffs = GIMP_RGB_R55[channel]
+
+        nomin = coeffs[0]
+        for degree in range(1, 6):
+            nomin = nomin * temperature + coeffs[degree]
+
+        denom = coeffs[6]
+        for degree in range(1, 6):
+            denom = denom * temperature + coeffs[6 + degree]
+
+        rgb[channel] = nomin / denom
+
+    return np.clip(rgb.astype(np.float32), 0.0, np.finfo(np.float32).max)
+
+
+def apply_color_temperature(rgb_image, original_kelvin, intended_kelvin):
+    original_rgb = kelvin_to_rgb(original_kelvin)
+    intended_rgb = kelvin_to_rgb(intended_kelvin)
+    gain = original_rgb / np.clip(intended_rgb, 1e-6, None)
+    return np.clip(rgb_image * gain.reshape(1, 1, 3), 0.0, 1.0)
+
+
+def blend_normal_np(base, overlay):
+    return overlay
+
+
+def blend_multiply_np(base, overlay):
+    return base * overlay
+
+
+def blend_screen_np(base, overlay):
+    return 1.0 - (1.0 - base) * (1.0 - overlay)
+
+
+def blend_overlay_np(base, overlay):
+    mask = base < 0.5
+    return np.where(mask, 2.0 * base * overlay, 1.0 - 2.0 * (1.0 - base) * (1.0 - overlay))
+
+
+def blend_soft_light_np(base, overlay):
+    term1 = base - (1.0 - 2.0 * overlay) * base * (1.0 - base)
+    term2 = base + (2.0 * overlay - 1.0) * (np.sqrt(np.clip(base, 0.0, 1.0) + 1e-6) - base)
+    return np.where(overlay < 0.5, term1, term2)
+
+
+def blend_hard_light_np(base, overlay):
+    mask = overlay < 0.5
+    return np.where(mask, 2.0 * base * overlay, 1.0 - 2.0 * (1.0 - base) * (1.0 - overlay))
+
+
+def blend_color_dodge_np(base, overlay):
+    return np.clip(base / (1.0 - overlay + 1e-6), 0.0, 1.0)
+
+
+def blend_color_burn_np(base, overlay):
+    return np.clip(1.0 - (1.0 - base) / (overlay + 1e-6), 0.0, 1.0)
+
+
+def blend_darken_np(base, overlay):
+    return np.minimum(base, overlay)
+
+
+def blend_lighten_np(base, overlay):
+    return np.maximum(base, overlay)
+
+
+EDIT_IMAGE_BLEND_MODE_FUNCS = {
+    "Replace": blend_normal_np,
+    "Normal": blend_normal_np,
+    "Multiply": blend_multiply_np,
+    "Screen": blend_screen_np,
+    "Overlay": blend_overlay_np,
+    "Soft Light": blend_soft_light_np,
+    "Hard Light": blend_hard_light_np,
+    "Color Dodge": blend_color_dodge_np,
+    "Color Burn": blend_color_burn_np,
+    "Darken": blend_darken_np,
+    "Lighten": blend_lighten_np,
+}
+
+EDIT_IMAGE_COLOR_TEMP_PRESETS = {
+    "none": 0.0,
+    "warm": 800.0,
+    "warmer": 1600.0,
+    "cold": -800.0,
+    "colder": -1600.0,
+}
+
+
 class RizzLoadLatestImage:
     @classmethod
     def INPUT_TYPES(cls):
@@ -959,6 +1087,7 @@ class RizzClean:
 class RizzEditImage:
     @classmethod
     def INPUT_TYPES(cls):
+        blend_modes = list(EDIT_IMAGE_BLEND_MODE_FUNCS.keys())
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -966,6 +1095,11 @@ class RizzEditImage:
                 "contrast": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "hue": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0}),
                 "saturation": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "color_temperature_preset": (["none", "warm", "warmer", "cold", "colder"], {"default": "none"}),
+                "original_temperature": ("FLOAT", {"default": 6500.0, "min": 1000.0, "max": 12000.0, "step": 50.0}),
+                "intended_temperature": ("FLOAT", {"default": 6500.0, "min": 1000.0, "max": 12000.0, "step": 50.0}),
+                "temperature_blend_mode": (blend_modes, {"default": "Replace"}),
+                "temperature_opacity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "flip_horizontal": ("BOOLEAN", {"default": False}),
                 "flip_vertical": ("BOOLEAN", {"default": False}),
                 "flip_mode": (["none", "horizontal", "vertical", "both"], {"default": "none"}),
@@ -987,6 +1121,11 @@ class RizzEditImage:
         contrast,
         hue,
         saturation,
+        color_temperature_preset="none",
+        original_temperature=6500.0,
+        intended_temperature=6500.0,
+        temperature_blend_mode="Replace",
+        temperature_opacity=1.0,
         flip_horizontal=False,
         flip_vertical=False,
         flip_mode="none",
@@ -1004,6 +1143,25 @@ class RizzEditImage:
             apply_flip_horizontal, apply_flip_vertical = False, True
         elif normalized_flip_mode == "both":
             apply_flip_horizontal, apply_flip_vertical = True, True
+
+        preset_key = str(color_temperature_preset or "none").lower()
+        preset_offset = EDIT_IMAGE_COLOR_TEMP_PRESETS.get(preset_key, 0.0)
+        resolved_original_temperature = float(np.clip(original_temperature, GIMP_LOWEST_TEMPERATURE, GIMP_HIGHEST_TEMPERATURE))
+        resolved_intended_temperature = float(np.clip(intended_temperature, GIMP_LOWEST_TEMPERATURE, GIMP_HIGHEST_TEMPERATURE))
+        if preset_key != "none":
+            resolved_intended_temperature = float(np.clip(
+                resolved_original_temperature + preset_offset,
+                GIMP_LOWEST_TEMPERATURE,
+                GIMP_HIGHEST_TEMPERATURE,
+            ))
+
+        blend_mode = temperature_blend_mode if temperature_blend_mode in EDIT_IMAGE_BLEND_MODE_FUNCS else "Replace"
+        blend_func = EDIT_IMAGE_BLEND_MODE_FUNCS[blend_mode]
+        color_temp_enabled = (
+            float(temperature_opacity) > 0.0
+            and abs(resolved_intended_temperature - resolved_original_temperature) > 1e-3
+        )
+        opacity = float(np.clip(temperature_opacity, 0.0, 1.0))
 
         rotation_steps = {"90": 1, "180": 2, "270": 3}
         rotation_key = str(rotation_angle)
@@ -1023,6 +1181,16 @@ class RizzEditImage:
                 hsv[..., 0] = (hsv[..., 0] + hue / 360.0) % 1.0
                 hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0.0, 1.0)
                 img_np = hsv_to_rgb(hsv)
+
+            if color_temp_enabled and img_np.shape[-1] >= 3:
+                base_rgb = img_np[..., :3]
+                temp_rgb = apply_color_temperature(
+                    base_rgb,
+                    resolved_original_temperature,
+                    resolved_intended_temperature,
+                )
+                blended_rgb = blend_func(base_rgb, temp_rgb)
+                img_np[..., :3] = np.clip(blended_rgb * opacity + base_rgb * (1.0 - opacity), 0.0, 1.0)
 
             if invert_colors:
                 img_np = 1.0 - img_np
@@ -1676,7 +1844,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzCropAndScaleFromMask": "Crop & Scale from Mask",
     "RizzPasteAndUnscale": "Paste & Unscale",
     "RizzClean": "Memory Cleaner",
-    "RizzEditImage": "Edit Image (Brightness/Contrast/Hue/Saturation)",
+    "RizzEditImage": "Edit Image (Color + Temperature)",
     "RizzChannelPack": "Channel Pack (Rizz)",
     "RizzChannelSplit": "Channel Split (Rizz)",
     "CreateImage": "Create Image",

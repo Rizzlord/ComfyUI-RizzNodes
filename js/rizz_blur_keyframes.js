@@ -42,6 +42,7 @@ app.registerExtension({
         let previewImage = null;
         let previewLoaded = false;
         let lastVideoPath = null;
+        let lastSourceSignature = "";
 
         const loadKeyframesFromWidget = () => {
             const w = getWidget("keyframes_json");
@@ -165,6 +166,21 @@ app.registerExtension({
             return null;
         };
 
+        const getSourceSignature = () => {
+            const videoInput = node.inputs?.find(i => i.name === "video");
+            let linkSig = "nolink";
+            if (videoInput) {
+                if (Array.isArray(videoInput.links)) {
+                    linkSig = videoInput.links.join(",");
+                } else {
+                    linkSig = `${videoInput.link ?? "null"}`;
+                }
+            }
+            const resolved = resolveVideoPath();
+            const resolvedSig = resolved ? JSON.stringify(resolved) : "nopath";
+            return `${linkSig}|${resolvedSig}`;
+        };
+
         let _lastVideoInfo = null;
         let _previewDebounce = null;
         let _lastPreviewFrame = -1;
@@ -254,6 +270,12 @@ app.registerExtension({
             if (origOnDrawForeground) origOnDrawForeground.apply(this, arguments);
 
             hideKeyframesWidget();
+            const srcSig = getSourceSignature();
+            if (srcSig !== lastSourceSignature) {
+                lastSourceSignature = srcSig;
+                lastVideoPath = null;
+                setTimeout(() => tryLoadPreview(currentFrame), 60);
+            }
 
             const ea = getEditorArea();
             const ta = getTimelineArea();
@@ -480,6 +502,28 @@ app.registerExtension({
             return mx >= ta.left && mx <= ta.left + ta.w && my >= ta.top && my <= ta.top + ta.h;
         }
 
+        function isPrimaryButtonPressed(e) {
+            if (!e) return true;
+            if (typeof e.buttons === "number") return (e.buttons & 1) === 1;
+            if (typeof e.which === "number") return e.which === 1;
+            return true;
+        }
+
+        function stopDragging() {
+            let changed = false;
+            if (draggingKf >= 0) {
+                saveKeyframesToWidget();
+                changed = true;
+            }
+            if (draggingTimeline) {
+                fetchFramePreview(currentFrame);
+                changed = true;
+            }
+            draggingKf = -1;
+            draggingTimeline = false;
+            if (changed) node.setDirtyCanvas(true, true);
+        }
+
         const origOnMouseDown = node.onMouseDown;
         node.onMouseDown = function (e, localPos) {
             const mx = localPos[0], my = localPos[1];
@@ -521,6 +565,10 @@ app.registerExtension({
             const mx = localPos[0], my = localPos[1];
             const ea = getEditorArea();
 
+            if ((draggingTimeline || draggingKf >= 0) && !isPrimaryButtonPressed(e)) {
+                stopDragging();
+            }
+
             if (draggingTimeline) {
                 currentFrame = frameFromTimelineX(mx);
                 fetchFramePreview(currentFrame);
@@ -552,14 +600,7 @@ app.registerExtension({
 
         const origOnMouseUp = node.onMouseUp;
         node.onMouseUp = function (e, localPos) {
-            if (draggingKf >= 0) {
-                saveKeyframesToWidget();
-            }
-            if (draggingTimeline) {
-                fetchFramePreview(currentFrame);
-            }
-            draggingKf = -1;
-            draggingTimeline = false;
+            stopDragging();
 
             if (origOnMouseUp) return origOnMouseUp.apply(this, arguments);
         };
@@ -591,6 +632,7 @@ app.registerExtension({
         node.onConnectionsChange = function () {
             if (origOnConnectionsChange) origOnConnectionsChange.apply(this, arguments);
             lastVideoPath = null;
+            lastSourceSignature = "";
             setTimeout(() => tryLoadPreview(), 500);
         };
 

@@ -15,6 +15,8 @@ app.registerExtension({
             setupLoadNode(node);
         } else if (node.comfyClass === "RizzUpscaleImageBatch") {
             setupUpscaleBatchNode(node);
+        } else if (node.comfyClass === "RizzEditImage") {
+            setupEditImageNode(node);
         }
     }
 });
@@ -284,4 +286,64 @@ function setupUpscaleBatchNode(node) {
     };
 
     setTimeout(updateWidgetVisibility, 50);
+}
+
+function setupEditImageNode(node) {
+    if (node.__rizz_edit_image_setup) return;
+    node.__rizz_edit_image_setup = true;
+
+    const presetWidget = node.widgets?.find(w => w.name === "color_temperature_preset");
+    const originalTempWidget = node.widgets?.find(w => w.name === "original_temperature");
+    const intendedTempWidget = node.widgets?.find(w => w.name === "intended_temperature");
+
+    if (!presetWidget || !originalTempWidget || !intendedTempWidget) return;
+
+    const presetOffsets = {
+        none: 0,
+        warm: 800,
+        warmer: 1600,
+        cold: -800,
+        colder: -1600,
+    };
+
+    const clampTemperature = (value) => {
+        const rounded = Math.round(Number(value) / 50) * 50;
+        return Math.max(1000, Math.min(12000, rounded));
+    };
+
+    const applyPresetTemperature = () => {
+        const preset = String(presetWidget.value ?? "none").toLowerCase();
+        if (!(preset in presetOffsets) || preset === "none") return;
+
+        const baseTemp = Number(originalTempWidget.value);
+        if (!Number.isFinite(baseTemp)) return;
+
+        const adjusted = clampTemperature(baseTemp + presetOffsets[preset]);
+        intendedTempWidget.value = adjusted;
+
+        if (typeof intendedTempWidget.callback === "function") {
+            intendedTempWidget.callback(adjusted);
+        }
+
+        node.setDirtyCanvas(true, true);
+    };
+
+    const wrapWidgetCallback = (widget, handler) => {
+        const originalCallback = widget.callback;
+        widget.callback = function (v) {
+            handler(v);
+            if (originalCallback) originalCallback.apply(this, arguments);
+        };
+    };
+
+    wrapWidgetCallback(presetWidget, applyPresetTemperature);
+    wrapWidgetCallback(originalTempWidget, applyPresetTemperature);
+
+    const origOnConfigure = node.onConfigure;
+    node.onConfigure = function () {
+        if (origOnConfigure) origOnConfigure.apply(this, arguments);
+        setTimeout(applyPresetTemperature, 0);
+    };
+
+    setTimeout(applyPresetTemperature, 50);
 }

@@ -1777,7 +1777,460 @@ class RizzEditClips:
 
 
 # ============================================================================
-# Node 10: RizzBlurSpot
+# Node 10: RizzTimelineEditor
+# ============================================================================
+
+class RizzTimelineEditor:
+    """Timeline renderer with 3 video and 3 audio sources.
+    The interactive editor lives in js/rizz_timeline_editor.js and writes timeline_json.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "timeline_json": ("STRING", {
+                    "default": "{\"timeline_length\":10.0,\"playhead\":0.0,\"video_clips\":[],\"audio_clips\":[]}",
+                    "multiline": True,
+                    "tooltip": "Internal timeline state (managed by the timeline editor UI).",
+                }),
+                "output_width": ("INT", {
+                    "default": 1280, "min": 64, "max": 8192, "step": 2,
+                    "tooltip": "Output video width in pixels.",
+                }),
+                "output_height": ("INT", {
+                    "default": 720, "min": 64, "max": 8192, "step": 2,
+                    "tooltip": "Output video height in pixels.",
+                }),
+                "output_fps": ("FLOAT", {
+                    "default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1,
+                    "tooltip": "Output framerate.",
+                }),
+                "include_video_audio": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Include audio from placed video clips if present.",
+                }),
+                "master_volume": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05,
+                    "tooltip": "Final mix output gain.",
+                }),
+            },
+            "optional": {
+                "video_1": ("VIDEO",),
+                "video_2": ("VIDEO",),
+                "video_3": ("VIDEO",),
+                "audio_1": ("AUDIO",),
+                "audio_2": ("AUDIO",),
+                "audio_3": ("AUDIO",),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "render_timeline"
+    CATEGORY = "RizzNodes/Video"
+
+    @staticmethod
+    def _safe_float(value, default=0.0):
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _to_bool(value, default=True):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "no", "off"}
+        return bool(value)
+
+    @staticmethod
+    def _fmt_num(value):
+        value = max(float(value), 0.0)
+        text = f"{value:.6f}".rstrip("0").rstrip(".")
+        return text if text else "0"
+
+    def _parse_timeline(self, timeline_json):
+        parsed = {
+            "timeline_length": 0.0,
+            "playhead": 0.0,
+            "video_clips": [],
+            "audio_clips": [],
+        }
+
+        if not timeline_json:
+            return parsed
+
+        try:
+            data = json.loads(timeline_json)
+        except Exception:
+            return parsed
+
+        if not isinstance(data, dict):
+            return parsed
+
+        parsed["timeline_length"] = max(0.0, self._safe_float(data.get("timeline_length", 0.0), 0.0))
+        parsed["playhead"] = max(0.0, self._safe_float(data.get("playhead", 0.0), 0.0))
+
+        def _normalize_clips(raw_list, media):
+            out = []
+            if not isinstance(raw_list, list):
+                return out
+
+            for idx, raw in enumerate(raw_list):
+                if not isinstance(raw, dict):
+                    continue
+
+                src = int(self._safe_float(raw.get("src", 1), 1))
+                if src < 1 or src > 3:
+                    continue
+
+                track = int(self._safe_float(raw.get("track", 0), 0))
+                track = max(0, min(2, track))
+
+                start = max(0.0, self._safe_float(raw.get("start", 0.0), 0.0))
+                trim_in = max(0.0, self._safe_float(raw.get("in", 0.0), 0.0))
+                dur = max(0.05, self._safe_float(raw.get("dur", 1.0), 1.0))
+                volume = max(0.0, self._safe_float(raw.get("volume", 1.0), 1.0))
+                enabled = self._to_bool(raw.get("enabled", True), True)
+                if not enabled:
+                    continue
+
+                clip_id = str(raw.get("id", f"{media}_{idx+1}"))
+                out.append({
+                    "id": clip_id,
+                    "src": src,
+                    "track": track,
+                    "start": start,
+                    "in": trim_in,
+                    "dur": dur,
+                    "volume": volume,
+                })
+            return out
+
+        parsed["video_clips"] = _normalize_clips(data.get("video_clips", []), "video")
+        parsed["audio_clips"] = _normalize_clips(data.get("audio_clips", []), "audio")
+        return parsed
+
+    def _audio_to_wav(self, audio_data, temp_dir, stem):
+        if not isinstance(audio_data, dict):
+            return None
+
+        waveform = audio_data.get("waveform")
+        sample_rate = int(self._safe_float(audio_data.get("sample_rate", 44100), 44100))
+        if sample_rate <= 0:
+            sample_rate = 44100
+        if waveform is None:
+            return None
+
+        if isinstance(waveform, torch.Tensor):
+            wave = waveform.detach().cpu().float()
+        else:
+            wave = torch.tensor(waveform, dtype=torch.float32)
+
+        if wave.dim() == 3:
+            wave = wave[0]
+        elif wave.dim() == 1:
+            wave = wave.unsqueeze(0)
+        elif wave.dim() != 2:
+            return None
+
+        # Expected Comfy shape: [channels, samples]
+        if wave.shape[0] > wave.shape[1] and wave.shape[1] <= 8:
+            wave = wave.transpose(0, 1)
+
+        if wave.dim() != 2 or wave.shape[-1] <= 0:
+            return None
+
+        samples = wave.transpose(0, 1).contiguous().numpy()
+        samples = np.clip(samples, -1.0, 1.0)
+        if samples.ndim == 1:
+            samples = samples[:, np.newaxis]
+
+        import soundfile as sf
+        audio_path = os.path.join(temp_dir, f"{stem}.wav")
+        sf.write(audio_path, samples, sample_rate, subtype="PCM_16")
+
+        duration = float(samples.shape[0]) / float(sample_rate) if sample_rate > 0 else 0.0
+        return {
+            "path": audio_path,
+            "duration": max(0.0, duration),
+            "sample_rate": sample_rate,
+        }
+
+    def render_timeline(self, timeline_json, output_width=1280, output_height=720, output_fps=30.0,
+                        include_video_audio=True, master_volume=1.0, **kwargs):
+        output_width = int(max(64, output_width))
+        output_height = int(max(64, output_height))
+        output_fps = max(1.0, float(output_fps))
+        master_volume = max(0.0, float(master_volume))
+
+        timeline = self._parse_timeline(timeline_json)
+
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        output_path = os.path.join(temp_dir, f"rizz_timeline_{uuid.uuid4().hex}.mp4")
+
+        temp_audio_files = []
+
+        try:
+            video_sources = {}
+            for i in range(1, 4):
+                video_input = kwargs.get(f"video_{i}")
+                if video_input is None:
+                    continue
+                try:
+                    video_sources[i] = ensure_video_dict(video_input)
+                except Exception as e:
+                    print(f"[RizzNodes Timeline] Failed to read video_{i}: {e}")
+
+            audio_sources = {}
+            for i in range(1, 4):
+                audio_input = kwargs.get(f"audio_{i}")
+                if audio_input is None:
+                    continue
+                try:
+                    audio_info = self._audio_to_wav(audio_input, temp_dir, f"rizz_timeline_audio_{i}_{uuid.uuid4().hex}")
+                    if audio_info and os.path.exists(audio_info["path"]):
+                        audio_sources[i] = audio_info
+                        temp_audio_files.append(audio_info["path"])
+                except Exception as e:
+                    print(f"[RizzNodes Timeline] Failed to read audio_{i}: {e}")
+
+            video_clips = []
+            for clip in timeline["video_clips"]:
+                source = video_sources.get(clip["src"])
+                if not source:
+                    continue
+
+                source_dur = max(0.0, self._safe_float(source.get("duration", 0.0), 0.0))
+                clip_in = clip["in"]
+                clip_dur = clip["dur"]
+                if source_dur > 0:
+                    if clip_in >= source_dur:
+                        continue
+                    clip_dur = min(clip_dur, max(0.0, source_dur - clip_in))
+
+                if clip_dur < 0.05:
+                    continue
+
+                video_clips.append({
+                    **clip,
+                    "dur": clip_dur,
+                })
+
+            audio_clips = []
+            for clip in timeline["audio_clips"]:
+                source = audio_sources.get(clip["src"])
+                if not source:
+                    continue
+
+                source_dur = max(0.0, self._safe_float(source.get("duration", 0.0), 0.0))
+                clip_in = clip["in"]
+                clip_dur = clip["dur"]
+                if source_dur > 0:
+                    if clip_in >= source_dur:
+                        continue
+                    clip_dur = min(clip_dur, max(0.0, source_dur - clip_in))
+
+                if clip_dur < 0.05:
+                    continue
+
+                audio_clips.append({
+                    **clip,
+                    "dur": clip_dur,
+                })
+
+            max_end = 0.0
+            for c in video_clips:
+                max_end = max(max_end, c["start"] + c["dur"])
+            for c in audio_clips:
+                max_end = max(max_end, c["start"] + c["dur"])
+
+            timeline_length = max(timeline["timeline_length"], max_end)
+            if timeline_length <= 0.0:
+                if video_sources:
+                    timeline_length = max(self._safe_float(v.get("duration", 0.0), 0.0) for v in video_sources.values())
+                elif audio_sources:
+                    timeline_length = max(self._safe_float(a.get("duration", 0.0), 0.0) for a in audio_sources.values())
+                else:
+                    timeline_length = 5.0
+            timeline_length = max(0.2, min(timeline_length, 21600.0))
+
+            filtered_video = []
+            for clip in video_clips:
+                if clip["start"] >= timeline_length:
+                    continue
+                clip_end = min(timeline_length, clip["start"] + clip["dur"])
+                clip_dur = clip_end - clip["start"]
+                if clip_dur >= 0.05:
+                    filtered_video.append({**clip, "dur": clip_dur})
+            video_clips = filtered_video
+
+            filtered_audio = []
+            for clip in audio_clips:
+                if clip["start"] >= timeline_length:
+                    continue
+                clip_end = min(timeline_length, clip["start"] + clip["dur"])
+                clip_dur = clip_end - clip["start"]
+                if clip_dur >= 0.05:
+                    filtered_audio.append({**clip, "dur": clip_dur})
+            audio_clips = filtered_audio
+
+            # Composite in timeline order first so moved/split clips are not visually
+            # overridden by long clips from another row purely due row index.
+            # If starts are equal, higher row index is composited first and lower index
+            # later (so V1 can win ties over V2/V3).
+            video_clips.sort(key=lambda x: (x["start"], -x["track"], x["id"]))
+            audio_clips.sort(key=lambda x: (x["start"], x["track"], x["id"]))
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-i", f"color=c=black:s={output_width}x{output_height}:r={self._fmt_num(output_fps)}:d={self._fmt_num(timeline_length)}",
+            ]
+
+            video_input_index = {}
+            used_video_sources = sorted({c["src"] for c in video_clips})
+            next_index = 1
+            for src in used_video_sources:
+                source_path = video_sources[src]["path"]
+                cmd.extend(["-i", source_path])
+                video_input_index[src] = next_index
+                next_index += 1
+
+            audio_input_index = {}
+            used_audio_sources = sorted({c["src"] for c in audio_clips})
+            for src in used_audio_sources:
+                source_path = audio_sources[src]["path"]
+                cmd.extend(["-i", source_path])
+                audio_input_index[src] = next_index
+                next_index += 1
+
+            filters = []
+            filters.append("[0:v]format=rgba,setpts=PTS-STARTPTS[vbase0]")
+            current_v = "vbase0"
+            frame_pad = 1.0 / output_fps if output_fps > 0 else 0.0
+
+            for idx, clip in enumerate(video_clips):
+                src_idx = video_input_index[clip["src"]]
+                clip_label = f"vclip{idx}"
+                out_label = f"vbase{idx+1}"
+
+                start_s = self._fmt_num(clip["start"])
+                dur_s = self._fmt_num(clip["dur"])
+                in_s = self._fmt_num(clip["in"])
+                frame_pad_s = self._fmt_num(frame_pad)
+
+                filters.append(
+                    f"[{src_idx}:v]trim=start={in_s}:duration={dur_s},setpts=PTS-STARTPTS,"
+                    f"fps={self._fmt_num(output_fps)},"
+                    f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,"
+                    f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    f"format=rgba,tpad=stop_mode=clone:stop_duration={frame_pad_s},"
+                    f"setpts=PTS+{start_s}/TB[{clip_label}]"
+                )
+                filters.append(f"[{current_v}][{clip_label}]overlay=shortest=0:eof_action=pass[{out_label}]")
+                current_v = out_label
+
+            filters.append(
+                f"[{current_v}]trim=duration={self._fmt_num(timeline_length)},setpts=PTS-STARTPTS,format=yuv420p[vout]"
+            )
+
+            audio_labels = []
+
+            if include_video_audio:
+                audio_clip_idx = 0
+                for clip in video_clips:
+                    src_meta = video_sources.get(clip["src"], {})
+                    if not src_meta.get("has_audio", False):
+                        continue
+                    src_idx = video_input_index[clip["src"]]
+                    label = f"vca{audio_clip_idx}"
+                    audio_clip_idx += 1
+
+                    start_s = self._fmt_num(clip["start"])
+                    dur_s = self._fmt_num(clip["dur"])
+                    in_s = self._fmt_num(clip["in"])
+                    vol_s = self._fmt_num(clip["volume"])
+                    delay_ms = max(0, int(round(clip["start"] * 1000.0)))
+
+                    filters.append(
+                        f"[{src_idx}:a]atrim=start={in_s}:duration={dur_s},asetpts=PTS-STARTPTS,"
+                        f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+                        f"volume={vol_s},adelay={delay_ms}|{delay_ms}[{label}]"
+                    )
+                    audio_labels.append(f"[{label}]")
+
+            for idx, clip in enumerate(audio_clips):
+                src_idx = audio_input_index[clip["src"]]
+                label = f"aca{idx}"
+
+                dur_s = self._fmt_num(clip["dur"])
+                in_s = self._fmt_num(clip["in"])
+                vol_s = self._fmt_num(clip["volume"])
+                delay_ms = max(0, int(round(clip["start"] * 1000.0)))
+
+                filters.append(
+                    f"[{src_idx}:a]atrim=start={in_s}:duration={dur_s},asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+                    f"volume={vol_s},adelay={delay_ms}|{delay_ms}[{label}]"
+                )
+                audio_labels.append(f"[{label}]")
+
+            has_audio_output = len(audio_labels) > 0
+            if has_audio_output:
+                filters.append(
+                    f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0,"
+                    f"volume={self._fmt_num(master_volume)},atrim=duration={self._fmt_num(timeline_length)},"
+                    f"asetpts=PTS-STARTPTS[aout]"
+                )
+
+            cmd.extend(["-filter_complex", ";".join(filters), "-map", "[vout]"])
+            if has_audio_output:
+                cmd.extend(["-map", "[aout]"])
+
+            cmd.extend([
+                "-r", self._fmt_num(output_fps),
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "20",
+                "-pix_fmt", "yuv420p",
+            ])
+
+            if has_audio_output:
+                cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+            else:
+                cmd.extend(["-an"])
+
+            cmd.extend([
+                "-movflags", "+faststart",
+                "-t", self._fmt_num(timeline_length),
+                output_path,
+            ])
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            if result.returncode != 0:
+                print(f"[RizzNodes Timeline] FFmpeg error:\n{result.stderr}")
+                raise RuntimeError(f"Timeline render failed: {result.stderr[:500]}")
+
+            return (get_video_info(output_path),)
+        finally:
+            for p in temp_audio_files:
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+
+# ============================================================================
+# Node 11: RizzBlurSpot
 # ============================================================================
 
 BLUR_INTERPOLATIONS = ["linear", "ease_in", "ease_out", "ease_in_out"]
@@ -2181,6 +2634,7 @@ NODE_CLASS_MAPPINGS = {
     "RizzExtractAllFrames": RizzExtractAllFrames,
     "RizzFramesToVideoBatch": RizzFramesToVideoBatch,
     "RizzEditClips": RizzEditClips,
+    "RizzTimelineEditor": RizzTimelineEditor,
     "RizzBlurSpot": RizzBlurSpot,
 }
 
@@ -2195,5 +2649,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RizzExtractAllFrames": "🎞️ Extract ALL Frames (Batch)",
     "RizzFramesToVideoBatch": "🎞️ Frames to Video (Batch)",
     "RizzEditClips": "✂️ Edit & Combine Clips (Rizz)",
+    "RizzTimelineEditor": "🎬 Timeline Editor (3 Video + 3 Audio)",
     "RizzBlurSpot": "🔵 Blur Spot (Keyframe)",
 }
