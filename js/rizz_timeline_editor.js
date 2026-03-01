@@ -13,6 +13,9 @@ const SNAP_THRESHOLD_PX = 10;
 const HIDDEN_WIDGET = "hidden";
 const TRIM_HANDLE_W = 5;
 const TRIM_HANDLE_PAD = 2;
+const AUDIO_VOLUME_MAX = 2.0;
+const AUDIO_VOL_HIT_PAD = 6;
+const AUDIO_FADE_HANDLE_R = 5;
 const TRANSITION_TYPES = [
     "Fade",
     "Smooth",
@@ -284,6 +287,7 @@ app.registerExtension({
                 })),
             };
             w.value = JSON.stringify(payload);
+            syncTimelineLengthWidget();
             node.setDirtyCanvas(true, true);
         };
 
@@ -302,6 +306,26 @@ app.registerExtension({
         const getTransitionDuration = () => {
             const w = getWidget("transition_duration");
             return Math.max(0.05, toNum(w?.value, 0.25));
+        };
+
+        const getTimelineLengthFromWidget = () => {
+            const w = getWidget("timeline_length_sec");
+            return Math.max(MIN_TIMELINE_SEC, toNum(w?.value, state.timelineLength));
+        };
+
+        const syncTimelineLengthWidget = () => {
+            const w = getWidget("timeline_length_sec");
+            if (!w) return;
+            const rounded = Number(state.timelineLength.toFixed(3));
+            if (toNum(w.value, rounded) !== rounded) {
+                w.value = rounded;
+            }
+        };
+
+        const applyTimelineLengthFromWidget = () => {
+            state.timelineLength = getTimelineLengthFromWidget();
+            state.playhead = clamp(state.playhead, 0, state.timelineLength);
+            saveToWidget();
         };
 
         const resolveTransitionTargetClip = () => {
@@ -386,9 +410,27 @@ app.registerExtension({
                 });
             }
 
+            let wTimelineLen = getWidget("timeline_length_sec");
+            if (!wTimelineLen) {
+                wTimelineLen = node.addWidget("number", "timeline_length_sec", state.timelineLength, () => {}, {
+                    min: MIN_TIMELINE_SEC,
+                    max: 21600,
+                    step: 0.1,
+                    precision: 3,
+                });
+            }
+
+            let wSetTimelineLen = getWidget("set_timeline_length");
+            if (!wSetTimelineLen) {
+                wSetTimelineLen = node.addWidget("button", "set_timeline_length", null, () => {
+                    applyTimelineLengthFromWidget();
+                });
+            }
+
             if (wType) wType.value = `${wType.value || "Fade"}`;
             if (wTarget) wTarget.value = `${wTarget.value || "In+Out"}`;
             if (wDuration) wDuration.value = Math.max(0.05, toNum(wDuration.value, 0.25));
+            syncTimelineLengthWidget();
         };
 
         const getTrackInfoFromRow = (row) => {
@@ -806,9 +848,67 @@ app.registerExtension({
             return out;
         };
 
+        const getTransitionDurationValue = (transition) => {
+            if (!transition || typeof transition !== "object") return 0;
+            return Math.max(0, toNum(transition.duration, 0));
+        };
+
+        const getAudioVolumeLineY = (clipRect) => {
+            const vol = clamp(toNum(clipRect.clip.volume, 1.0), 0, AUDIO_VOLUME_MAX);
+            const t = vol / AUDIO_VOLUME_MAX;
+            return clipRect.y + clipRect.h - t * clipRect.h;
+        };
+
+        const getAudioFadeHandlePos = (clipRect, layout) => {
+            const pxPerSec = layout.timeWidth / Math.max(getDuration(), 0.0001);
+            const maxPx = clipRect.w * 0.49;
+            const inPx = Math.min(maxPx, getTransitionDurationValue(clipRect.clip.transition_in) * pxPerSec);
+            const outPx = Math.min(maxPx, getTransitionDurationValue(clipRect.clip.transition_out) * pxPerSec);
+            const y = getAudioVolumeLineY(clipRect);
+            return {
+                inX: clipRect.x + inPx,
+                outX: clipRect.x + clipRect.w - outPx,
+                y,
+            };
+        };
+
+        const getClipRectById = (media, id, layout) => {
+            const rects = collectClipRects(layout);
+            return rects.find((r) => r.media === media && r.clip.id === id) || null;
+        };
+
         const hitTestButton = (mx, my) => {
             for (const b of uiCache.buttons) {
                 if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) return b;
+            }
+            return null;
+        };
+
+        const hitTestAudioControl = (mx, my, layout) => {
+            for (let i = uiCache.clipRects.length - 1; i >= 0; i--) {
+                const r = uiCache.clipRects[i];
+                if (r.media !== "audio") continue;
+                if (mx < r.x || mx > r.x + r.w || my < r.y || my > r.y + r.h) continue;
+
+                const handles = getAudioFadeHandlePos(r, layout);
+                const dxIn = mx - handles.inX;
+                const dyIn = my - handles.y;
+                if (dxIn * dxIn + dyIn * dyIn <= (AUDIO_FADE_HANDLE_R + 3) * (AUDIO_FADE_HANDLE_R + 3)) {
+                    return { mode: "audio_fade_in", media: "audio", id: r.clip.id };
+                }
+
+                const dxOut = mx - handles.outX;
+                const dyOut = my - handles.y;
+                if (dxOut * dxOut + dyOut * dyOut <= (AUDIO_FADE_HANDLE_R + 3) * (AUDIO_FADE_HANDLE_R + 3)) {
+                    return { mode: "audio_fade_out", media: "audio", id: r.clip.id };
+                }
+
+                const ly = getAudioVolumeLineY(r);
+                const safeLeft = r.x + Math.max(10, TRIM_HANDLE_W + TRIM_HANDLE_PAD + 4);
+                const safeRight = r.x + r.w - Math.max(10, TRIM_HANDLE_W + TRIM_HANDLE_PAD + 4);
+                if (mx >= safeLeft && mx <= safeRight && Math.abs(my - ly) <= AUDIO_VOL_HIT_PAD) {
+                    return { mode: "audio_volume", media: "audio", id: r.clip.id };
+                }
             }
             return null;
         };
@@ -982,11 +1082,33 @@ app.registerExtension({
                     ctx.fillRect(r.x + r.w - tw - 1, r.y + 1, tw, Math.min(8, r.h - 2));
                 }
 
+                if (r.media === "audio") {
+                    const volY = getAudioVolumeLineY(r);
+                    const handles = getAudioFadeHandlePos(r, layout);
+
+                    ctx.strokeStyle = "rgba(255,255,255,0.8)";
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(r.x + 6, volY);
+                    ctx.lineTo(r.x + r.w - 6, volY);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.fillStyle = "rgba(250,250,255,0.95)";
+                    ctx.arc(handles.inX, handles.y, AUDIO_FADE_HANDLE_R, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.beginPath();
+                    ctx.arc(handles.outX, handles.y, AUDIO_FADE_HANDLE_R, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
                 ctx.fillStyle = "rgba(18,18,22,0.92)";
                 ctx.font = "bold 10px sans-serif";
                 ctx.textAlign = "left";
                 ctx.textBaseline = "middle";
-                const label = `${r.media === "video" ? "V" : "A"}${r.clip.src}  ${r.clip.dur.toFixed(2)}s`;
+                const volText = r.media === "audio" ? `  vol:${toNum(r.clip.volume, 1).toFixed(2)}` : "";
+                const label = `${r.media === "video" ? "V" : "A"}${r.clip.src}  ${r.clip.dur.toFixed(2)}s${volText}`;
                 ctx.fillText(label, r.x + 6, r.y + r.h * 0.5);
             }
 
@@ -1026,7 +1148,7 @@ app.registerExtension({
             ctx.font = "10px sans-serif";
             ctx.textAlign = "left";
             ctx.textBaseline = "alphabetic";
-            ctx.fillText("Drag edge grabbers to trim, magnetic snap enabled, C=cut, Del=delete, transitions via widgets above", layout.left + 4, layout.top + layout.height - 4);
+            ctx.fillText("Audio: drag line for volume, side circles for fades. Clips: edge grabbers trim, snap enabled.", layout.left + 4, layout.top + layout.height - 4);
         };
 
         const startDrag = (mode, data = {}) => {
@@ -1061,6 +1183,21 @@ app.registerExtension({
             const hitButton = hitTestButton(mx, my);
             if (hitButton) {
                 applyButtonAction(hitButton.id);
+                return true;
+            }
+
+            const audioCtrl = hitTestAudioControl(mx, my, layout);
+            if (audioCtrl) {
+                selectClip(audioCtrl.media, audioCtrl.id);
+                const clip = findClip(audioCtrl.media, audioCtrl.id);
+                startDrag(audioCtrl.mode, {
+                    media: audioCtrl.media,
+                    id: audioCtrl.id,
+                    startX: mx,
+                    startY: my,
+                    origVolume: clip ? toNum(clip.volume, 1.0) : 1.0,
+                });
+                node.setDirtyCanvas(true, true);
                 return true;
             }
 
@@ -1121,6 +1258,36 @@ app.registerExtension({
             if (drag.mode === "scrub") {
                 updatePlayheadFromX(mx, layout);
                 snapGuideTime = null;
+                saveToWidget();
+                return true;
+            }
+
+            if (drag.mode === "audio_volume" || drag.mode === "audio_fade_in" || drag.mode === "audio_fade_out") {
+                const clip = findClip("audio", drag.id);
+                const rect = getClipRectById("audio", drag.id, layout);
+                if (!clip || !rect) {
+                    stopDrag();
+                    return true;
+                }
+
+                if (drag.mode === "audio_volume") {
+                    const norm = clamp((rect.y + rect.h - my) / Math.max(rect.h, 1), 0, 1);
+                    clip.volume = norm * AUDIO_VOLUME_MAX;
+                } else {
+                    const pxPerSec = layout.timeWidth / Math.max(getDuration(), 0.0001);
+                    const maxFade = Math.max(0, clip.dur * 0.49);
+                    let fadeDur = 0;
+                    if (drag.mode === "audio_fade_in") {
+                        fadeDur = clamp((mx - rect.x) / Math.max(pxPerSec, 0.0001), 0, maxFade);
+                        clip.transition_in = fadeDur <= 0.02 ? null : { type: "Fade", duration: Number(fadeDur.toFixed(4)) };
+                    } else {
+                        fadeDur = clamp((rect.x + rect.w - mx) / Math.max(pxPerSec, 0.0001), 0, maxFade);
+                        clip.transition_out = fadeDur <= 0.02 ? null : { type: "Fade", duration: Number(fadeDur.toFixed(4)) };
+                    }
+                }
+
+                snapGuideTime = null;
+                ensureTimelineBounds();
                 saveToWidget();
                 return true;
             }
